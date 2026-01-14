@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VPinball High Score WebSocket Test</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #4ec9b0;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .status.connected {
+            background: #0e3a0e;
+            color: #4ec9b0;
+            border: 1px solid #4ec9b0;
+        }
+        .status.disconnected {
+            background: #3a0e0e;
+            color: #f48771;
+            border: 1px solid #f48771;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #1177bb;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .messages {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 15px;
+            height: 400px;
+            overflow-y: auto;
+            margin: 20px 0;
+        }
+        .message {
+            margin: 5px 0;
+            padding: 8px;
+            border-radius: 3px;
+            border-left: 3px solid #0e639c;
+            background: #1e1e1e;
+        }
+        .message.high-scores {
+            border-left-color: #4ec9b0;
+        }
+        .message.current-scores {
+            border-left-color: #dcdcaa;
+        }
+        .message-type {
+            font-weight: bold;
+            color: #569cd6;
+        }
+        .message-rom {
+            color: #ce9178;
+        }
+        .message-data {
+            color: #d4d4d4;
+            white-space: pre-wrap;
+            margin-top: 5px;
+        }
+        .timestamp {
+            color: #858585;
+            font-size: 12px;
+        }
+        .section-title {
+            color: #4ec9b0;
+            font-size: 18px;
+            font-weight: bold;
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }
+        .raw-json {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            margin: 20px 0;
+        }
+        .json-entry {
+            margin: 5px 0;
+            padding: 8px;
+            border-radius: 3px;
+            background: #1e1e1e;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: #d4d4d4;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+    </style>
+</head>
+<body>
+    <h1>VPinball High Score WebSocket Monitor</h1>
+
+    <div id="status" class="status disconnected">
+        Disconnected
+    </div>
+
+    <div class="controls">
+        <button id="connectBtn">Connect to ws://192.168.1.228:3131</button>
+        <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        <button onclick="clearMessages()">Clear Messages</button>
+    </div>
+
+    <div class="section-title">Parsed Messages</div>
+    <div class="messages" id="messages">
+        <div style="color: #858585;">Waiting for connection...</div>
+    </div>
+
+    <div class="section-title">Raw JSON</div>
+    <div class="raw-json" id="rawJson">
+        <div style="color: #858585;">Waiting for messages...</div>
+    </div>
+
+    <script>
+        let ws = null;
+        let reconnectTimer = null;
+        let manualDisconnect = false;
+        const statusDiv = document.getElementById('status');
+        const messagesDiv = document.getElementById('messages');
+        const rawJsonDiv = document.getElementById('rawJson');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+
+        function updateStatus(connected, attempting = false) {
+            if (connected) {
+                statusDiv.textContent = 'Connected to ws://192.168.1.228:3131';
+                statusDiv.className = 'status connected';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+            } else if (attempting) {
+                statusDiv.textContent = 'Connecting...';
+                statusDiv.className = 'status disconnected';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+            } else {
+                statusDiv.textContent = 'Disconnected';
+                statusDiv.className = 'status disconnected';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+            }
+        }
+
+        function addMessage(type, data) {
+            const timestamp = new Date().toLocaleTimeString();
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message ' + type;
+
+            let content = `<div class="timestamp">${timestamp}</div>`;
+            content += `<div class="message-type">Type: ${type}</div>`;
+
+            if (data.rom) {
+                content += `<div class="message-rom">ROM: ${data.rom}</div>`;
+            }
+
+            if (type === 'high-scores') {
+                content += `<div class="message-data">`;
+                data.scores.forEach((entry) => {
+                    content += `${entry.label}: ${entry.initials} - ${entry.score}\n`;
+                });
+                content += `</div>`;
+            } else if (type === 'current-scores') {
+                content += `<div class="message-data">`;
+                content += `Players: ${data.players}, Current Player: ${data.current_player}, Ball: ${data.current_ball}\n`;
+                content += `Scores:\n`;
+                data.scores.forEach((scoreObj, idx) => {
+                    content += `  ${scoreObj.player}: ${scoreObj.score}\n`;
+                });
+                content += `</div>`;
+            }
+
+            messageDiv.innerHTML = content;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function addRawJson(rawData) {
+            const timestamp = new Date().toLocaleTimeString();
+            const jsonEntry = document.createElement('div');
+            jsonEntry.className = 'json-entry';
+
+            // Pretty print JSON
+            let formatted;
+            try {
+                const parsed = JSON.parse(rawData);
+                formatted = JSON.stringify(parsed, null, 2);
+            } catch (e) {
+                formatted = rawData;
+            }
+
+            jsonEntry.textContent = `[${timestamp}]\n${formatted}`;
+            rawJsonDiv.appendChild(jsonEntry);
+            rawJsonDiv.scrollTop = rawJsonDiv.scrollHeight;
+        }
+
+        function connect() {
+            // Clear any existing reconnect timer
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
+            // Don't try to connect if already connected or connecting
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+                return;
+            }
+
+            try {
+                updateStatus(false, true); // Show "Connecting..."
+                ws = new WebSocket('ws://192.168.1.228:3131');
+
+                ws.onopen = () => {
+                    console.log('WebSocket connected');
+                    updateStatus(true);
+                    messagesDiv.innerHTML = '<div style="color: #4ec9b0;">Connected! Waiting for score data...</div>';
+                    rawJsonDiv.innerHTML = '<div style="color: #4ec9b0;">Connected! Waiting for messages...</div>';
+                };
+
+                ws.onmessage = (event) => {
+                    console.log('Received:', event.data);
+
+                    // Add raw JSON
+                    addRawJson(event.data);
+
+                    // Parse and display formatted message
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'high_scores') {
+                            addMessage('high-scores', data);
+                        } else if (data.type === 'current_scores') {
+                            addMessage('current-scores', data);
+                        } else {
+                            addMessage('unknown', data);
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse message:', e);
+                        messagesDiv.innerHTML += `<div style="color: #f48771;">Error parsing message: ${event.data}</div>`;
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                };
+
+                ws.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    updateStatus(false);
+                    ws = null;
+
+                    // Auto-reconnect if not manually disconnected
+                    if (!manualDisconnect) {
+                        console.log('Will retry connection in 1 second...');
+                        reconnectTimer = setTimeout(connect, 1000);
+                    }
+                };
+            } catch (e) {
+                console.error('Failed to connect:', e);
+                ws = null;
+
+                // Auto-reconnect on error if not manually disconnected
+                if (!manualDisconnect) {
+                    reconnectTimer = setTimeout(connect, 1000);
+                }
+            }
+        }
+
+        function disconnect() {
+            manualDisconnect = true;
+
+            // Clear reconnect timer
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function clearMessages() {
+            messagesDiv.innerHTML = '<div style="color: #858585;">Messages cleared. Waiting for new data...</div>';
+            rawJsonDiv.innerHTML = '<div style="color: #858585;">Messages cleared. Waiting for new data...</div>';
+        }
+
+        // Auto-connect on page load
+        window.addEventListener('load', () => {
+            manualDisconnect = false;
+            connect();
+        });
+
+        // Re-enable auto-connect when user clicks connect button
+        connectBtn.addEventListener('click', () => {
+            manualDisconnect = false;
+            connect();
+        });
+    </script>
+</body>
+</html>
