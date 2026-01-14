@@ -657,23 +657,116 @@ std::string decodeBCD(const std::vector<uint8_t>& nvram, size_t start, size_t le
     return result.str();
 }
 
-// Decode character string from NVRAM bytes
-std::string decodeChar(const std::vector<uint8_t>& nvram, size_t start, size_t length) {
+// Decode character string from NVRAM bytes with optional character map
+std::string decodeChar(const std::vector<uint8_t>& nvram, size_t start, size_t length, const std::string& charMap = "") {
     if (start + length > nvram.size()) {
         return "ERROR";
     }
 
     std::string result;
     for (size_t i = 0; i < length; i++) {
-        char c = (char)nvram[start + i];
-        if (c >= 32 && c <= 126) { // printable ASCII
-            result += c;
+        uint8_t byte = nvram[start + i];
+
+        if (!charMap.empty()) {
+            // Use character map if provided
+            if (byte < charMap.length()) {
+                result += charMap[byte];
+            } else {
+                result += '?';
+            }
         } else {
-            result += '?';
+            // Fallback to ASCII if no char map
+            if (byte >= 32 && byte <= 126) {
+                result += (char)byte;
+            } else {
+                result += '?';
+            }
         }
     }
 
     return result;
+}
+
+// Helper function to parse start address from JSON (handles both hex strings and numbers)
+size_t parseStartAddress(const JsonValue* startVal) {
+    if (!startVal) {
+        return 0;
+    }
+
+    if (startVal->type == JsonValue::STRING) {
+        // Parse hex string like "0x6A5"
+        return std::stoul(startVal->strValue, nullptr, 16);
+    } else if (startVal->type == JsonValue::NUMBER) {
+        return startVal->numValue;
+    }
+
+    return 0;
+}
+
+// Decode a value from NVRAM with proper encoding, mask, and offset support
+int decodeValue(const std::vector<uint8_t>& nvram, const JsonValue* fieldObj) {
+    if (!fieldObj || fieldObj->type != JsonValue::OBJECT) {
+        return 0;
+    }
+
+    const JsonValue* startVal = fieldObj->get("start");
+    size_t start = parseStartAddress(startVal);
+
+    if (start >= nvram.size()) {
+        return 0;
+    }
+
+    // Get encoding (default to "int" if not specified)
+    const JsonValue* encodingVal = fieldObj->get("encoding");
+    std::string encoding = (encodingVal && encodingVal->type == JsonValue::STRING) ? encodingVal->strValue : "int";
+
+    // Get mask (default to 0xFF if not specified)
+    uint32_t mask = 0xFF;
+    const JsonValue* maskVal = fieldObj->get("mask");
+    if (maskVal) {
+        if (maskVal->type == JsonValue::STRING) {
+            // Parse hex string like "0x0F"
+            mask = std::stoul(maskVal->strValue, nullptr, 16);
+        } else if (maskVal->type == JsonValue::NUMBER) {
+            mask = maskVal->numValue;
+        }
+    }
+
+    // Get offset (default to 0 if not specified)
+    int offset = 0;
+    const JsonValue* offsetVal = fieldObj->get("offset");
+    if (offsetVal && offsetVal->type == JsonValue::NUMBER) {
+        offset = offsetVal->numValue;
+    }
+
+    int value = 0;
+
+    if (encoding == "bcd") {
+        // BCD encoding - single byte
+        uint8_t byte = nvram[start];
+        byte &= mask;
+        uint8_t high = (byte >> 4) & 0x0F;
+        uint8_t low = byte & 0x0F;
+        if (high <= 9 && low <= 9) {
+            value = high * 10 + low;
+        }
+    } else if (encoding == "int") {
+        // Integer encoding - single byte
+        value = nvram[start] & mask;
+    } else if (encoding == "bool") {
+        // Boolean encoding
+        const JsonValue* invertVal = fieldObj->get("invert");
+        bool invert = (invertVal && invertVal->type == JsonValue::BOOLEAN && invertVal->boolValue);
+        value = (nvram[start] & mask) ? 1 : 0;
+        if (invert) {
+            value = !value;
+        }
+    }
+
+    // Apply offset
+    value += offset;
+
+    return value;
 }
 
 // Get NVRAM data directly from PinMAME Controller via Scriptable API
@@ -783,33 +876,24 @@ void extractAndLogCurrentScores() {
 
     // Get player count
     const JsonValue* playerCountObj = gameState->get("player_count");
-    int playerCount = 0;
-    if (playerCountObj && playerCountObj->type == JsonValue::OBJECT) {
+    int playerCount = decodeValue(liveNvram, playerCountObj);
+
+    // Debug: log the raw byte and decoded value
+    if (playerCountObj) {
         const JsonValue* startVal = playerCountObj->get("start");
-        if (startVal && startVal->numValue < (int64_t)liveNvram.size()) {
-            playerCount = liveNvram[startVal->numValue];
+        size_t addr = parseStartAddress(startVal);
+        if (addr < liveNvram.size()) {
+            LOGI("DEBUG: player_count at 0x%zx = 0x%02X, decoded = %d", addr, liveNvram[addr], playerCount);
         }
     }
 
     // Get current player
     const JsonValue* currentPlayerObj = gameState->get("current_player");
-    int currentPlayer = 0;
-    if (currentPlayerObj && currentPlayerObj->type == JsonValue::OBJECT) {
-        const JsonValue* startVal = currentPlayerObj->get("start");
-        if (startVal && startVal->numValue < (int64_t)liveNvram.size()) {
-            currentPlayer = liveNvram[startVal->numValue];
-        }
-    }
+    int currentPlayer = decodeValue(liveNvram, currentPlayerObj);
 
     // Get current ball
     const JsonValue* currentBallObj = gameState->get("current_ball");
-    int currentBall = 0;
-    if (currentBallObj && currentBallObj->type == JsonValue::OBJECT) {
-        const JsonValue* startVal = currentBallObj->get("start");
-        if (startVal && startVal->numValue < (int64_t)liveNvram.size()) {
-            currentBall = liveNvram[startVal->numValue];
-        }
-    }
+    int currentBall = decodeValue(liveNvram, currentBallObj);
 
     // Get scores array
     const JsonValue* scores = gameState->get("scores");
@@ -837,14 +921,15 @@ void extractAndLogCurrentScores() {
         if (!labelVal || !startVal || !lengthVal || !encodingVal) continue;
 
         std::string score;
+        size_t startAddr = parseStartAddress(startVal);
         if (encodingVal->strValue == "bcd") {
-            score = decodeBCD(liveNvram, startVal->numValue, lengthVal->numValue);
+            score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
         } else if (encodingVal->strValue == "int") {
             uint64_t value = 0;
             size_t len = lengthVal->numValue;
-            if (startVal->numValue + len <= liveNvram.size()) {
+            if (startAddr + len <= liveNvram.size()) {
                 for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | liveNvram[startVal->numValue + j];
+                    value = (value << 8) | liveNvram[startAddr + j];
                 }
                 score = std::to_string(value);
             } else {
@@ -880,14 +965,15 @@ void extractAndLogCurrentScores() {
         if (!labelVal || !startVal || !lengthVal || !encodingVal) continue;
 
         std::string score;
+        size_t startAddr = parseStartAddress(startVal);
         if (encodingVal->strValue == "bcd") {
-            score = decodeBCD(liveNvram, startVal->numValue, lengthVal->numValue);
+            score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
         } else if (encodingVal->strValue == "int") {
             uint64_t value = 0;
             size_t len = lengthVal->numValue;
-            if (startVal->numValue + len <= liveNvram.size()) {
+            if (startAddr + len <= liveNvram.size()) {
                 for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | liveNvram[startVal->numValue + j];
+                    value = (value << 8) | liveNvram[startAddr + j];
                 }
                 score = std::to_string(value);
             }
@@ -960,8 +1046,9 @@ bool extractHighScores(const std::string& mapFilePath, const std::vector<uint8_t
         if (!initStart || !initLength || !initEncoding) continue;
 
         std::string initials;
+        size_t initStartAddr = parseStartAddress(initStart);
         if (initEncoding->strValue == "ch") {
-            initials = decodeChar(nvram, initStart->numValue, initLength->numValue);
+            initials = decodeChar(nvram, initStartAddr, initLength->numValue);
         } else {
             initials = "???";
         }
@@ -974,15 +1061,16 @@ bool extractHighScores(const std::string& mapFilePath, const std::vector<uint8_t
         if (!scoreStart || !scoreLength || !scoreEncoding) continue;
 
         std::string score;
+        size_t scoreStartAddr = parseStartAddress(scoreStart);
         if (scoreEncoding->strValue == "bcd") {
-            score = decodeBCD(nvram, scoreStart->numValue, scoreLength->numValue);
+            score = decodeBCD(nvram, scoreStartAddr, scoreLength->numValue);
         } else if (scoreEncoding->strValue == "int") {
             // Simple integer decoding (big-endian)
             uint64_t value = 0;
             size_t len = scoreLength->numValue;
-            if (scoreStart->numValue + len <= nvram.size()) {
+            if (scoreStartAddr + len <= nvram.size()) {
                 for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | nvram[scoreStart->numValue + j];
+                    value = (value << 8) | nvram[scoreStartAddr + j];
                 }
                 score = std::to_string(value);
             } else {
@@ -1135,6 +1223,16 @@ void extractAndSaveHighScores(const char* eventName) {
         return;
     }
 
+    // Get character map from _metadata if available
+    std::string charMap;
+    const JsonValue* metadata = mapRoot->get("_metadata");
+    if (metadata && metadata->type == JsonValue::OBJECT) {
+        const JsonValue* charMapVal = metadata->get("char_map");
+        if (charMapVal && charMapVal->type == JsonValue::STRING) {
+            charMap = charMapVal->strValue;
+        }
+    }
+
     // Get high_scores array
     const JsonValue* highScores = mapRoot->get("high_scores");
     if (!highScores || highScores->type != JsonValue::ARRAY) {
@@ -1173,8 +1271,9 @@ void extractAndSaveHighScores(const char* eventName) {
         if (!initStart || !initLength || !initEncoding) continue;
 
         std::string initials;
+        size_t initStartAddr = parseStartAddress(initStart);
         if (initEncoding->strValue == "ch") {
-            initials = decodeChar(nvramData, initStart->numValue, initLength->numValue);
+            initials = decodeChar(nvramData, initStartAddr, initLength->numValue, charMap);
         } else {
             initials = "???";
         }
@@ -1187,14 +1286,15 @@ void extractAndSaveHighScores(const char* eventName) {
         if (!scoreStart || !scoreLength || !scoreEncoding) continue;
 
         std::string score;
+        size_t scoreStartAddr = parseStartAddress(scoreStart);
         if (scoreEncoding->strValue == "bcd") {
-            score = decodeBCD(nvramData, scoreStart->numValue, scoreLength->numValue);
+            score = decodeBCD(nvramData, scoreStartAddr, scoreLength->numValue);
         } else if (scoreEncoding->strValue == "int") {
             uint64_t value = 0;
             size_t len = scoreLength->numValue;
-            if (scoreStart->numValue + len <= nvramData.size()) {
+            if (scoreStartAddr + len <= nvramData.size()) {
                 for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | nvramData[scoreStart->numValue + j];
+                    value = (value << 8) | nvramData[scoreStartAddr + j];
                 }
                 score = std::to_string(value);
             } else {
@@ -1268,33 +1368,15 @@ void checkAndBroadcastCurrentScores() {
         return;
     }
 
-    // Get current game state
+    // Get current game state (use decodeValue to handle encoding/mask/offset)
     const JsonValue* playerCountObj = gameState->get("player_count");
-    int playerCount = 0;
-    if (playerCountObj && playerCountObj->type == JsonValue::OBJECT) {
-        const JsonValue* startVal = playerCountObj->get("start");
-        if (startVal && startVal->numValue < (int64_t)liveNvram.size()) {
-            playerCount = liveNvram[startVal->numValue];
-        }
-    }
+    int playerCount = decodeValue(liveNvram, playerCountObj);
 
     const JsonValue* currentPlayerObj = gameState->get("current_player");
-    int currentPlayer = 0;
-    if (currentPlayerObj && currentPlayerObj->type == JsonValue::OBJECT) {
-        const JsonValue* startVal = currentPlayerObj->get("start");
-        if (startVal && startVal->numValue < (int64_t)liveNvram.size()) {
-            currentPlayer = liveNvram[startVal->numValue];
-        }
-    }
+    int currentPlayer = decodeValue(liveNvram, currentPlayerObj);
 
     const JsonValue* currentBallObj = gameState->get("current_ball");
-    int currentBall = 0;
-    if (currentBallObj && currentBallObj->type == JsonValue::OBJECT) {
-        const JsonValue* startVal = currentBallObj->get("start");
-        if (startVal && startVal->numValue < (int64_t)liveNvram.size()) {
-            currentBall = liveNvram[startVal->numValue];
-        }
-    }
+    int currentBall = decodeValue(liveNvram, currentBallObj);
 
     // Get scores array
     const JsonValue* scores = gameState->get("scores");
@@ -1316,14 +1398,15 @@ void checkAndBroadcastCurrentScores() {
         if (!startVal || !lengthVal || !encodingVal) continue;
 
         std::string score;
+        size_t startAddr = parseStartAddress(startVal);
         if (encodingVal->strValue == "bcd") {
-            score = decodeBCD(liveNvram, startVal->numValue, lengthVal->numValue);
+            score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
         } else if (encodingVal->strValue == "int") {
             uint64_t value = 0;
             size_t len = lengthVal->numValue;
-            if (startVal->numValue + len <= liveNvram.size()) {
+            if (startAddr + len <= liveNvram.size()) {
                 for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | liveNvram[startVal->numValue + j];
+                    value = (value << 8) | liveNvram[startAddr + j];
                 }
                 score = std::to_string(value);
             }
