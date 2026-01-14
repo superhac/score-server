@@ -127,7 +127,7 @@
     </div>
 
     <div class="controls">
-        <button id="connectBtn">Connect to ws://192.168.1.228:3131</button>
+        <button id="connectBtn">Connect to ws://localhost:3131</button>
         <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
         <button onclick="clearMessages()">Clear Messages</button>
     </div>
@@ -154,7 +154,7 @@
 
         function updateStatus(connected, attempting = false) {
             if (connected) {
-                statusDiv.textContent = 'Connected to ws://192.168.1.228:3131';
+                statusDiv.textContent = 'Connected to ws://localhost:3131';
                 statusDiv.className = 'status connected';
                 connectBtn.disabled = true;
                 disconnectBtn.disabled = false;
@@ -237,7 +237,7 @@
 
             try {
                 updateStatus(false, true); // Show "Connecting..."
-                ws = new WebSocket('ws://192.168.1.228:3131');
+                ws = new WebSocket('ws://localhost:3131');
 
                 ws.onopen = () => {
                     console.log('WebSocket connected');
