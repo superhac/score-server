@@ -33,10 +33,12 @@
    #pragma comment(lib, "ws2_32.lib")
    typedef int socklen_t;
    #include <windows.h>
+   #define SHUT_RDWR SD_BOTH
 #else
    #include <sys/types.h>
    #include <sys/socket.h>
    #include <netinet/in.h>
+   #include <netinet/tcp.h>
    #include <arpa/inet.h>
    #include <unistd.h>
    #include <netdb.h>
@@ -92,6 +94,19 @@ LPI_IMPLEMENT // Implement shared log support
 #define LOGI LPI_LOGI
 #define LOGW LPI_LOGW
 #define LOGE LPI_LOGE
+
+// Get current timestamp in ISO 8601 format
+std::string getTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+
+    std::stringstream ss;
+    ss << std::put_time(std::gmtime(&time_t_now), "%Y-%m-%dT%H:%M:%S");
+    ss << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
+    return ss.str();
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // WebSocket implementation
@@ -529,8 +544,21 @@ void webSocketServerThread() {
         return;
     }
 
+    // Set socket options for reliability
     int opt = 1;
     setsockopt(wsServerSocket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+#ifndef _WIN32
+    // On Linux, also set SO_REUSEPORT to allow immediate rebind
+    setsockopt(wsServerSocket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+    // Enable TCP keepalive
+    setsockopt(wsServerSocket, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+    // Set SO_LINGER to 0 for immediate close without TIME_WAIT
+    linger lin{};
+    lin.l_onoff = 1;
+    lin.l_linger = 0;
+    setsockopt(wsServerSocket, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lin), sizeof(lin));
 
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
@@ -563,8 +591,8 @@ void webSocketServerThread() {
         FD_SET(wsServerSocket, &readfds);
 
         timeval timeout{};
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;  // 100ms - responsive to new connections
 
         int activity = select(wsServerSocket + 1, &readfds, nullptr, nullptr, &timeout);
         if (activity < 0) break;
@@ -577,6 +605,22 @@ void webSocketServerThread() {
 
             if (clientSocket != INVALID_SOCKET) {
                 LOGI("New WebSocket connection from %s", inet_ntoa(clientAddr.sin_addr));
+
+                // Set socket options for client connection
+                int opt = 1;
+                setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+                // Set SO_LINGER to 0 for immediate close
+                linger clientLin{};
+                clientLin.l_onoff = 1;
+                clientLin.l_linger = 0;
+                setsockopt(clientSocket, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&clientLin), sizeof(clientLin));
+
+                // Set receive timeout to avoid hanging
+                timeval recvTimeout{};
+                recvTimeout.tv_sec = 5;  // 5 second timeout for handshake
+                recvTimeout.tv_usec = 0;
+                setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
 
                 // Read HTTP upgrade request
                 char buffer[4096];
@@ -615,9 +659,15 @@ void webSocketServerThread() {
 
                         LOGI("WebSocket handshake completed, %zu clients connected", wsClients.size());
                     } else {
+                        LOGW("WebSocket handshake failed: no Sec-WebSocket-Key found");
                         closesocket(clientSocket);
                     }
                 } else {
+                    if (bytesRead == 0) {
+                        LOGW("Client closed connection before sending handshake");
+                    } else {
+                        LOGW("Failed to receive WebSocket handshake (bytes: %d)", bytesRead);
+                    }
                     closesocket(clientSocket);
                 }
             }
@@ -1071,7 +1121,9 @@ void extractAndLogCurrentScores() {
 
     // Broadcast via WebSocket as JSON
     std::stringstream jsonOutput;
-    jsonOutput << "{\"type\":\"current_scores\",\"rom\":\"" << currentRomName << "\","
+    jsonOutput << "{\"type\":\"current_scores\","
+               << "\"timestamp\":\"" << getTimestamp() << "\","
+               << "\"rom\":\"" << currentRomName << "\","
                << "\"players\":" << playerCount << ","
                << "\"current_player\":" << currentPlayer << ","
                << "\"current_ball\":" << currentBall << ","
@@ -1388,7 +1440,10 @@ void extractAndSaveHighScores(const char* eventName) {
 
     // Build JSON output with structured high scores
     std::stringstream jsonOutput;
-    jsonOutput << "{\"type\":\"high_scores\",\"rom\":\"" << currentRomName << "\",\"scores\":[";
+    jsonOutput << "{\"type\":\"high_scores\","
+               << "\"timestamp\":\"" << getTimestamp() << "\","
+               << "\"rom\":\"" << currentRomName << "\","
+               << "\"scores\":[";
 
     // Also build text output for logging
     std::stringstream textOutput;
@@ -1620,6 +1675,13 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
         currentRomName = msg->gameId;
         LOGI("Game started: %s", currentRomName.c_str());
 
+        // Broadcast game start message via WebSocket
+        std::stringstream gameStartMsg;
+        gameStartMsg << "{\"type\":\"game_start\","
+                     << "\"timestamp\":\"" << getTimestamp() << "\","
+                     << "\"rom\":\"" << currentRomName << "\"}";
+        broadcastWebSocket(gameStartMsg.str());
+
         // Clear previous NVRAM data
         nvramData.clear();
 
@@ -1644,6 +1706,15 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
 }
 
 void onGameEnd(const unsigned int eventId, void* userData, void* eventData) {
+    LOGI("Game ended: %s", currentRomName.c_str());
+
+    // Broadcast game end message via WebSocket
+    std::stringstream gameEndMsg;
+    gameEndMsg << "{\"type\":\"game_end\","
+               << "\"timestamp\":\"" << getTimestamp() << "\","
+               << "\"rom\":\"" << currentRomName << "\"}";
+    broadcastWebSocket(gameEndMsg.str());
+
     extractAndSaveHighScores("Game end");
 
     // Clear map path when game ends
@@ -1725,13 +1796,27 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
 {
     LOGI("Score Server Plugin unloading");
 
+    // Send game_end message if a game was active
+    if (!currentRomName.empty()) {
+        std::stringstream gameEndMsg;
+        gameEndMsg << "{\"type\":\"game_end\","
+                   << "\"timestamp\":\"" << getTimestamp() << "\","
+                   << "\"rom\":\"" << currentRomName << "\"}";
+        broadcastWebSocket(gameEndMsg.str());
+
+        // Give a brief moment for the message to be sent
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
     // Stop WebSocket server
     wsServerRunning = false;
 
-    // Close all client connections
+    // Shutdown and close all client connections gracefully
     {
         std::lock_guard<std::mutex> lock(wsClientsMutex);
         for (SOCKET client : wsClients) {
+            // Shutdown the connection gracefully before closing
+            shutdown(client, SHUT_RDWR);
             closesocket(client);
         }
         wsClients.clear();
@@ -1739,6 +1824,7 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
 
     // Close server socket to wake up accept()
     if (wsServerSocket != INVALID_SOCKET) {
+        shutdown(wsServerSocket, SHUT_RDWR);
         closesocket(wsServerSocket);
         wsServerSocket = INVALID_SOCKET;
     }

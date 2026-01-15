@@ -74,6 +74,12 @@
         .message.current-scores {
             border-left-color: #dcdcaa;
         }
+        .message.game-start {
+            border-left-color: #608b4e;
+        }
+        .message.game-end {
+            border-left-color: #c586c0;
+        }
         .message-type {
             font-weight: bold;
             color: #569cd6;
@@ -127,7 +133,7 @@
     </div>
 
     <div class="controls">
-        <button id="connectBtn">Connect to ws://localhost:3131</button>
+        <button id="connectBtn">Connect to ws://192.168.1.228:3131</button>
         <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
         <button onclick="clearMessages()">Clear Messages</button>
     </div>
@@ -154,7 +160,7 @@
 
         function updateStatus(connected, attempting = false) {
             if (connected) {
-                statusDiv.textContent = 'Connected to ws://localhost:3131';
+                statusDiv.textContent = 'Connected to ws://192.168.1.228:3131';
                 statusDiv.className = 'status connected';
                 connectBtn.disabled = true;
                 disconnectBtn.disabled = false;
@@ -172,18 +178,24 @@
         }
 
         function addMessage(type, data) {
-            const timestamp = new Date().toLocaleTimeString();
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message ' + type;
 
-            let content = `<div class="timestamp">${timestamp}</div>`;
-            content += `<div class="message-type">Type: ${type}</div>`;
+            let content = `<div class="message-type">Type: ${type}</div>`;
 
             if (data.rom) {
                 content += `<div class="message-rom">ROM: ${data.rom}</div>`;
             }
 
-            if (type === 'high-scores') {
+            if (data.timestamp) {
+                content += `<div class="timestamp">Server Time: ${data.timestamp}</div>`;
+            }
+
+            if (type === 'game-start') {
+                content += `<div class="message-data">Game started</div>`;
+            } else if (type === 'game-end') {
+                content += `<div class="message-data">Game ended</div>`;
+            } else if (type === 'high-scores') {
                 content += `<div class="message-data">`;
                 data.scores.forEach((entry) => {
                     content += `${entry.label}: ${entry.initials} - ${entry.score}\n`;
@@ -205,7 +217,6 @@
         }
 
         function addRawJson(rawData) {
-            const timestamp = new Date().toLocaleTimeString();
             const jsonEntry = document.createElement('div');
             jsonEntry.className = 'json-entry';
 
@@ -218,7 +229,7 @@
                 formatted = rawData;
             }
 
-            jsonEntry.textContent = `[${timestamp}]\n${formatted}`;
+            jsonEntry.textContent = formatted;
             rawJsonDiv.appendChild(jsonEntry);
             rawJsonDiv.scrollTop = rawJsonDiv.scrollHeight;
         }
@@ -237,7 +248,7 @@
 
             try {
                 updateStatus(false, true); // Show "Connecting..."
-                ws = new WebSocket('ws://localhost:3131');
+                ws = new WebSocket('ws://192.168.1.228:3131');
 
                 ws.onopen = () => {
                     console.log('WebSocket connected');
@@ -255,7 +266,11 @@
                     // Parse and display formatted message
                     try {
                         const data = JSON.parse(event.data);
-                        if (data.type === 'high_scores') {
+                        if (data.type === 'game_start') {
+                            addMessage('game-start', data);
+                        } else if (data.type === 'game_end') {
+                            addMessage('game-end', data);
+                        } else if (data.type === 'high_scores') {
                             addMessage('high-scores', data);
                         } else if (data.type === 'current_scores') {
                             addMessage('current-scores', data);

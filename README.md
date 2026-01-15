@@ -1,18 +1,17 @@
 # Score Server Plugin
 
 This plugin provides a WebSocket server that broadcasts high scores and live game scores in real-time for PinMAME games.
-<img width="1220" height="1068" alt="image" src="https://github.com/user-attachments/assets/aea04641-4be3-43cd-9f6f-6918671abce6" />
-
-Early prototype score dashboard: https://youtube.com/shorts/kHgwnBB_v2o
 
 ## Features
 
 - **WebSocket server on port 3131** - broadcasts scores to connected clients in real-time
+- **Game lifecycle tracking** - sends game_start and game_end messages with timestamps
 - **Real-time current scores** - sends player scores, current player, and ball number as they change during gameplay
 - **High scores broadcast** - sends structured high scores with player initials when games start/end
+- **Timestamps on all messages** - ISO 8601 format (UTC) for precise event tracking
 - **Change detection** - only broadcasts when game state actually changes (not time-based polling)
 - **Automatic reconnection** - clients automatically reconnect if connection is lost
-- **Structured JSON output** - high scores sent as JSON arrays, not text blobs
+- **Structured JSON output** - all messages sent as structured JSON
 - Automatically detects the ROM being played
 - Uses the [pinmame-nvram-maps](https://github.com/tomlogic/pinmame-nvram-maps) project to decode NVRAM data
 - **Includes bundled NVRAM maps** - supports 628+ ROMs out of the box!
@@ -49,12 +48,34 @@ The plugin starts a WebSocket server on port **3131** that listens on all networ
 
 ### Message Types
 
-The plugin sends two types of WebSocket messages:
+The plugin sends four types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC).
+
+#### Game Start
+Sent when a new game begins.
+```json
+{
+  "type": "game_start",
+  "timestamp": "2026-01-15T12:34:56.789Z",
+  "rom": "mm_109"
+}
+```
+
+#### Game End
+Sent when a game ends.
+```json
+{
+  "type": "game_end",
+  "timestamp": "2026-01-15T12:45:30.123Z",
+  "rom": "mm_109"
+}
+```
 
 #### High Scores
+Sent on game start and game end with the current high score table.
 ```json
 {
   "type": "high_scores",
+  "timestamp": "2026-01-15T12:34:56.890Z",
   "rom": "mm_109",
   "scores": [
     {"label": "Grand Champion", "initials": "WTH", "score": "3000000000"},
@@ -65,9 +86,11 @@ The plugin sends two types of WebSocket messages:
 ```
 
 #### Current Scores (Live Gameplay)
+Sent whenever game state changes during active play.
 ```json
 {
   "type": "current_scores",
+  "timestamp": "2026-01-15T12:35:20.456Z",
   "rom": "afm_113b",
   "players": 2,
   "current_player": 1,
@@ -122,22 +145,7 @@ Check the [pinmame-nvram-maps repository](https://github.com/tomlogic/pinmame-nv
 
 The plugin is built automatically when you build VPinball with CMake:
 
-go into your `plugins` and clone repo:
-```
-git clone https://github.com/superhac/score-server.git
-```
-
-Edit `make/CMakeLists_plugins.txt` and add:
-```
-include("${CMAKE_SOURCE_DIR}/make/CMakeLists_plugin_ScoreServer.txt")
-```
-
-Copy CMakeLists_plugin_ScoreServer.txt (when your inside the score-server dir)
-```
-cp CMakeLists_plugin_ScoreServer.txt ../../make/
-```
-
-```
+```bash
 cmake --build . --target ScoreServerPlugin
 ```
 
@@ -182,15 +190,23 @@ const ws = new WebSocket('ws://192.168.1.100:3131');
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
 
+  if (data.type === 'game_start') {
+    console.log(`[${data.timestamp}] Game started: ${data.rom}`);
+  }
+
+  if (data.type === 'game_end') {
+    console.log(`[${data.timestamp}] Game ended: ${data.rom}`);
+  }
+
   if (data.type === 'current_scores') {
-    console.log(`${data.rom}: Player ${data.current_player} - Ball ${data.current_ball}`);
+    console.log(`[${data.timestamp}] ${data.rom}: Player ${data.current_player} - Ball ${data.current_ball}`);
     data.scores.forEach(score => {
       console.log(`  ${score.player}: ${score.score}`);
     });
   }
 
   if (data.type === 'high_scores') {
-    console.log(`High Scores for ${data.rom}:`);
+    console.log(`[${data.timestamp}] High Scores for ${data.rom}:`);
     data.scores.forEach(entry => {
       console.log(`  ${entry.label}: ${entry.initials} - ${entry.score}`);
     });
@@ -206,13 +222,19 @@ import json
 def on_message(ws, message):
     data = json.loads(message)
 
-    if data['type'] == 'current_scores':
-        print(f"{data['rom']}: Player {data['current_player']} - Ball {data['current_ball']}")
+    if data['type'] == 'game_start':
+        print(f"[{data['timestamp']}] Game started: {data['rom']}")
+
+    elif data['type'] == 'game_end':
+        print(f"[{data['timestamp']}] Game ended: {data['rom']}")
+
+    elif data['type'] == 'current_scores':
+        print(f"[{data['timestamp']}] {data['rom']}: Player {data['current_player']} - Ball {data['current_ball']}")
         for score in data['scores']:
             print(f"  {score['player']}: {score['score']}")
 
     elif data['type'] == 'high_scores':
-        print(f"High Scores for {data['rom']}:")
+        print(f"[{data['timestamp']}] High Scores for {data['rom']}:")
         for entry in data['scores']:
             print(f"  {entry['label']}: {entry['initials']} - {entry['score']}")
 
