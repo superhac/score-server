@@ -22,6 +22,7 @@
 
 // For JSON parsing - using a simple JSON parser approach
 #include <map>
+#include <set>
 
 // WebSocket support
 #ifdef _WIN32
@@ -40,7 +41,7 @@
    #include <unistd.h>
    #include <netdb.h>
    #include <dlfcn.h>
-   #include <linux/limits.h>
+   #include <limits.h>
    typedef int SOCKET;
    #define INVALID_SOCKET -1
    #define SOCKET_ERROR -1
@@ -60,6 +61,9 @@ std::string currentRomName;
 std::string nvramMapsPath;
 std::string currentMapPath;
 std::vector<uint8_t> nvramData;
+size_t nvramBaseAddress = 0;  // NVRAM base address from platform file
+bool nvramFromController = false;  // True if NVRAM came from Controller (flat memory), false if from disk (.nv file)
+bool nvramHighNibbleOnly = false;  // True if NVRAM uses only high nibble (e.g., Bally games)
 
 // TODO: To get NVRAM directly from the Controller, we need the PinMAME plugin to expose
 // the Controller object pointer via a message or event. For now, this remains nullptr
@@ -644,14 +648,24 @@ std::string decodeBCD(const std::vector<uint8_t>& nvram, size_t start, size_t le
     }
 
     std::stringstream result;
-    for (size_t i = 0; i < length; i++) {
-        uint8_t byte = nvram[start + i];
-        uint8_t high = (byte >> 4) & 0x0F;
-        uint8_t low = byte & 0x0F;
 
-        // BCD digits should be 0-9
-        if (high <= 9) result << (char)('0' + high);
-        if (low <= 9) result << (char)('0' + low);
+    // Read bytes in reverse order for Bally games (least-significant digit first)
+    // For high nibble only mode, read from end to start
+    if (nvramHighNibbleOnly) {
+        for (int i = length - 1; i >= 0; i--) {
+            uint8_t byte = nvram[start + i];
+            uint8_t high = (byte >> 4) & 0x0F;
+            if (high <= 9) result << (char)('0' + high);
+        }
+    } else {
+        // Standard BCD - read forward, both nibbles
+        for (size_t i = 0; i < length; i++) {
+            uint8_t byte = nvram[start + i];
+            uint8_t high = (byte >> 4) & 0x0F;
+            uint8_t low = byte & 0x0F;
+            if (high <= 9) result << (char)('0' + high);
+            if (low <= 9) result << (char)('0' + low);
+        }
     }
 
     return result.str();
@@ -688,19 +702,28 @@ std::string decodeChar(const std::vector<uint8_t>& nvram, size_t start, size_t l
 }
 
 // Helper function to parse start address from JSON (handles both hex strings and numbers)
-size_t parseStartAddress(const JsonValue* startVal) {
+// If adjustForBase is true, subtracts nvramBaseAddress to get offset into NVRAM data
+size_t parseStartAddress(const JsonValue* startVal, bool adjustForBase = true) {
     if (!startVal) {
         return 0;
     }
 
+    size_t address = 0;
     if (startVal->type == JsonValue::STRING) {
         // Parse hex string like "0x6A5"
-        return std::stoul(startVal->strValue, nullptr, 16);
+        address = std::stoul(startVal->strValue, nullptr, 16);
     } else if (startVal->type == JsonValue::NUMBER) {
-        return startVal->numValue;
+        address = startVal->numValue;
     }
 
-    return 0;
+    // Adjust for NVRAM base address to get offset into actual NVRAM data
+    // Controller.NVRAM returns only the NVRAM region starting at base address
+    // So we always subtract base address for NVRAM region addresses
+    if (adjustForBase && address >= nvramBaseAddress) {
+        address -= nvramBaseAddress;
+    }
+
+    return address;
 }
 
 // Decode a value from NVRAM with proper encoding, mask, and offset support
@@ -710,6 +733,22 @@ int decodeValue(const std::vector<uint8_t>& nvram, const JsonValue* fieldObj) {
     }
 
     const JsonValue* startVal = fieldObj->get("start");
+
+    // Check if address is in RAM region (below NVRAM base)
+    // Controller.NVRAM doesn't include RAM, so return 0 for RAM addresses
+    if (startVal) {
+        size_t rawAddr = parseStartAddress(startVal, false);  // Get unadjusted address
+        if (rawAddr < nvramBaseAddress) {
+            // Address is in RAM region, not accessible from NVRAM
+            static std::set<size_t> warnedAddrs;
+            if (warnedAddrs.find(rawAddr) == warnedAddrs.end()) {
+                LOGW("Skipping field at RAM address 0x%zx (NVRAM starts at 0x%zx)", rawAddr, nvramBaseAddress);
+                warnedAddrs.insert(rawAddr);
+            }
+            return 0;
+        }
+    }
+
     size_t start = parseStartAddress(startVal);
 
     if (start >= nvram.size()) {
@@ -820,6 +859,24 @@ bool getNVRAMFromController(std::vector<uint8_t>& nvram) {
     // The data is stored right after the lengths array (1 dimension = 1 length value)
     uint8_t* dataPtr = reinterpret_cast<uint8_t*>(&arr->lengths[1]);
 
+    // Debug: log NVRAM size (only first time per ROM) and first few bytes
+    static std::string lastRomLogged;
+    if (lastRomLogged != currentRomName) {
+        LOGI("NVRAM size for %s: %zu bytes", currentRomName.c_str(), arraySize);
+
+        // Log first 32 bytes to understand the layout
+        std::stringstream hexDump;
+        hexDump << "First 32 bytes: ";
+        for (size_t i = 0; i < std::min(arraySize, (size_t)32); i++) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02X ", dataPtr[i]);
+            hexDump << buf;
+        }
+        LOGI("%s", hexDump.str().c_str());
+
+        lastRomLogged = currentRomName;
+    }
+
     // Copy bytes from array
     nvram.resize(arraySize);
     memcpy(nvram.data(), dataPtr, arraySize);
@@ -878,15 +935,6 @@ void extractAndLogCurrentScores() {
     const JsonValue* playerCountObj = gameState->get("player_count");
     int playerCount = decodeValue(liveNvram, playerCountObj);
 
-    // Debug: log the raw byte and decoded value
-    if (playerCountObj) {
-        const JsonValue* startVal = playerCountObj->get("start");
-        size_t addr = parseStartAddress(startVal);
-        if (addr < liveNvram.size()) {
-            LOGI("DEBUG: player_count at 0x%zx = 0x%02X, decoded = %d", addr, liveNvram[addr], playerCount);
-        }
-    }
-
     // Get current player
     const JsonValue* currentPlayerObj = gameState->get("current_player");
     int currentPlayer = decodeValue(liveNvram, currentPlayerObj);
@@ -902,14 +950,89 @@ void extractAndLogCurrentScores() {
         return;
     }
 
+    // If playerCount is 0 (RAM address not accessible), infer from non-zero scores
+    std::vector<std::string> allScores;
+    int inferredPlayerCount = 0;
+
+    if (playerCount == 0) {
+        // Extract all scores first to count non-zero ones
+        for (size_t i = 0; i < scores->arrayValue.size(); i++) {
+            const JsonValue* scoreEntry = scores->at(i);
+            if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) {
+                allScores.push_back("");
+                continue;
+            }
+
+            const JsonValue* startVal = scoreEntry->get("start");
+            const JsonValue* lengthVal = scoreEntry->get("length");
+            const JsonValue* encodingVal = scoreEntry->get("encoding");
+
+            if (!startVal || !lengthVal || !encodingVal) {
+                allScores.push_back("");
+                continue;
+            }
+
+            std::string score;
+            size_t startAddr = parseStartAddress(startVal);
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
+            } else if (encodingVal->strValue == "int") {
+                uint64_t value = 0;
+                size_t len = lengthVal->numValue;
+                if (startAddr + len <= liveNvram.size()) {
+                    for (size_t j = 0; j < len; j++) {
+                        value = (value << 8) | liveNvram[startAddr + j];
+                    }
+                    score = std::to_string(value);
+                } else {
+                    score = "ERROR";
+                }
+            } else {
+                score = "???";
+            }
+
+            allScores.push_back(score);
+
+            // Count as active player if score is non-zero/non-empty
+            if (!score.empty() && score != "0" && score != "ERROR" && score != "???") {
+                bool allZeros = true;
+                for (char c : score) {
+                    if (c != '0') {
+                        allZeros = false;
+                        break;
+                    }
+                }
+                if (!allZeros) {
+                    inferredPlayerCount = i + 1;  // Player count is highest non-zero player index + 1
+                }
+            }
+        }
+
+        playerCount = (inferredPlayerCount > 0) ? inferredPlayerCount : 1;  // At least 1 player
+    }
+
     // Build output
     std::stringstream output;
     output << "=== Current Game Status for " << currentRomName << " ===\n";
     output << "Players: " << playerCount << " | Current Player: " << currentPlayer << " | Ball: " << currentBall << "\n";
     output << "----------------------------------------\n";
 
-    // Extract each player's score
-    for (size_t i = 0; i < scores->arrayValue.size() && i < (size_t)playerCount; i++) {
+    // Extract each player's score (use pre-extracted scores if available)
+    if (!allScores.empty()) {
+        // Use already extracted scores
+        for (size_t i = 0; i < allScores.size() && i < (size_t)playerCount; i++) {
+            const JsonValue* scoreEntry = scores->at(i);
+            if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) continue;
+
+            const JsonValue* labelVal = scoreEntry->get("label");
+            if (!labelVal) continue;
+
+            std::string playerMarker = (i + 1 == (size_t)currentPlayer) ? " <-- PLAYING" : "";
+            output << labelVal->strValue << ": " << std::right << std::setw(15) << allScores[i] << playerMarker << "\n";
+        }
+    } else {
+        // Extract scores normally
+        for (size_t i = 0; i < scores->arrayValue.size() && i < (size_t)playerCount; i++) {
         const JsonValue* scoreEntry = scores->at(i);
         if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) continue;
 
@@ -941,6 +1064,7 @@ void extractAndLogCurrentScores() {
 
         std::string playerMarker = (i + 1 == (size_t)currentPlayer) ? " <-- PLAYING" : "";
         output << labelVal->strValue << ": " << std::right << std::setw(15) << score << playerMarker << "\n";
+        }
     }
 
     LOGI("Current Scores:\n%s", output.str().c_str());
@@ -1138,74 +1262,10 @@ void extractAndSaveHighScores(const char* eventName) {
     // Store map path for current score extraction
     currentMapPath = mapPath;
 
-    // Try to get NVRAM from Controller first
-    bool gotNVRAM = false;
-    if (scriptApi && pinmameController) {
-        LOGI("Attempting to get NVRAM from PinMAME Controller");
-        gotNVRAM = getNVRAMFromController(nvramData);
-    }
-
-    // Fall back to reading from disk if Controller method failed
-    if (!gotNVRAM) {
-        LOGI("Getting NVRAM from disk file");
-        // Try to read NVRAM file from disk
-    // PinMAME stores .nv files in the nvram subdirectory
-    if (vpxApi) {
-        VPXInfo vpxInfo;
-        vpxApi->GetVpxInfo(&vpxInfo);
-
-        // Try common PinMAME NVRAM locations
-        // The triple slashes you saw (///) suggest prefPath already ends with a slash
-        std::string prefPath = vpxInfo.prefPath;
-
-        // Remove trailing slashes
-        while (!prefPath.empty() && (prefPath.back() == '/' || prefPath.back() == '\\')) {
-            prefPath.pop_back();
-        }
-
-        std::vector<std::string> nvramPaths = {
-            prefPath + "/pinmame/nvram/" + currentRomName + ".nv",
-            prefPath + "/nvram/" + currentRomName + ".nv",
-            prefPath + "/.pinmame/nvram/" + currentRomName + ".nv",
-            std::string(getenv("HOME") ? getenv("HOME") : "") + "/.pinmame/nvram/" + currentRomName + ".nv",
-        };
-
-        LOGI("Searching for NVRAM file in %zu locations...", nvramPaths.size());
-        bool found = false;
-        for (const auto& nvPath : nvramPaths) {
-            LOGD("  Trying: %s", nvPath.c_str());
-            std::ifstream nvFile(nvPath, std::ios::binary);
-            if (nvFile.is_open()) {
-                nvFile.seekg(0, std::ios::end);
-                size_t size = nvFile.tellg();
-                nvFile.seekg(0, std::ios::beg);
-
-                nvramData.resize(size);
-                nvFile.read(reinterpret_cast<char*>(nvramData.data()), size);
-                nvFile.close();
-
-                LOGI("Read NVRAM file: %s (%zu bytes)", nvPath.c_str(), size);
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            LOGE("Failed to find NVRAM file for ROM: %s", currentRomName.c_str());
-            LOGE("Checked locations:");
-            for (const auto& nvPath : nvramPaths) {
-                LOGE("  - %s", nvPath.c_str());
-            }
-            LOGE("Hint: Make sure PinMAME has saved the NVRAM file by playing the game first");
-            return;
-        }
-    }
-    } // End of disk fallback
-
-    // Extract high scores - build JSON directly
+    // Load platform file to get NVRAM base address
     std::ifstream mapFile(mapPath);
     if (!mapFile.is_open()) {
-        LOGE("Failed to open map file for high scores: %s", mapPath.c_str());
+        LOGE("Failed to open map file to read platform: %s", mapPath.c_str());
         return;
     }
 
@@ -1214,24 +1274,109 @@ void extractAndSaveHighScores(const char* eventName) {
     std::string mapJsonContent = mapBuffer.str();
     mapFile.close();
 
-    // Parse JSON map
+    // Parse JSON map to get platform
     SimpleJsonParser mapParser;
     JsonValue* mapRoot = mapParser.parse(mapJsonContent);
     if (!mapRoot || mapRoot->type != JsonValue::OBJECT) {
-        LOGE("Failed to parse JSON map file for high scores");
+        LOGE("Failed to parse JSON map file for platform");
         delete mapRoot;
         return;
     }
 
-    // Get character map from _metadata if available
-    std::string charMap;
+    // Extract the platform name from _metadata
     const JsonValue* metadata = mapRoot->get("_metadata");
-    if (metadata && metadata->type == JsonValue::OBJECT) {
-        const JsonValue* charMapVal = metadata->get("char_map");
-        if (charMapVal && charMapVal->type == JsonValue::STRING) {
-            charMap = charMapVal->strValue;
+    if (!metadata || metadata->type != JsonValue::OBJECT) {
+        LOGE("Map file missing _metadata section for ROM: %s", currentRomName.c_str());
+        delete mapRoot;
+        return;
+    }
+
+    const JsonValue* platformVal = metadata->get("platform");
+    if (!platformVal || platformVal->type != JsonValue::STRING) {
+        LOGE("Map file missing platform in _metadata for ROM: %s", currentRomName.c_str());
+        delete mapRoot;
+        return;
+    }
+
+    std::string platform = platformVal->strValue;
+    LOGI("Platform for %s: %s", currentRomName.c_str(), platform.c_str());
+
+    // Get character map from _metadata if available (while we have mapRoot)
+    std::string charMap;
+    const JsonValue* charMapVal = metadata->get("char_map");
+    if (charMapVal && charMapVal->type == JsonValue::STRING) {
+        charMap = charMapVal->strValue;
+    }
+
+    // DON'T delete mapRoot yet - we'll reuse it for high score extraction
+
+    // Load platform file to get NVRAM base address
+    std::string platformPath = nvramMapsPath + "/platforms/" + platform + ".json";
+    std::ifstream platformFile(platformPath);
+    if (!platformFile.is_open()) {
+        LOGE("Failed to open platform file: %s", platformPath.c_str());
+        return;
+    }
+
+    std::stringstream platformBuffer;
+    platformBuffer << platformFile.rdbuf();
+    std::string platformJsonContent = platformBuffer.str();
+    platformFile.close();
+
+    JsonValue* platformRoot = mapParser.parse(platformJsonContent);
+    if (!platformRoot || platformRoot->type != JsonValue::OBJECT) {
+        LOGE("Failed to parse platform JSON: %s", platformPath.c_str());
+        delete platformRoot;
+        return;
+    }
+
+    // Find NVRAM base address and nibble mode from memory_layout
+    nvramBaseAddress = 0;
+    nvramHighNibbleOnly = false;
+    const JsonValue* memoryLayout = platformRoot->get("memory_layout");
+    if (memoryLayout && memoryLayout->type == JsonValue::ARRAY) {
+        for (size_t i = 0; i < memoryLayout->arrayValue.size(); i++) {
+            const JsonValue* entry = memoryLayout->at(i);
+            if (entry && entry->type == JsonValue::OBJECT) {
+                const JsonValue* typeVal = entry->get("type");
+                if (typeVal && typeVal->type == JsonValue::STRING && typeVal->strValue == "nvram") {
+                    const JsonValue* addressVal = entry->get("address");
+                    if (addressVal && addressVal->type == JsonValue::STRING) {
+                        nvramBaseAddress = parseStartAddress(addressVal, false);  // Don't adjust when reading base address itself
+                        LOGI("Found NVRAM base address for %s: 0x%zx (%zu)", platform.c_str(), nvramBaseAddress, nvramBaseAddress);
+                    }
+
+                    // Check for nibble mode
+                    const JsonValue* nibbleVal = entry->get("nibble");
+                    if (nibbleVal && nibbleVal->type == JsonValue::STRING && nibbleVal->strValue == "high") {
+                        nvramHighNibbleOnly = true;
+                        LOGI("NVRAM uses high nibble only");
+                    }
+                    break;
+                }
+            }
         }
     }
+    delete platformRoot;
+
+    // Try to get NVRAM from Controller first
+    bool gotNVRAM = false;
+    if (scriptApi && pinmameController) {
+        LOGI("Attempting to get NVRAM from PinMAME Controller");
+        gotNVRAM = getNVRAMFromController(nvramData);
+        if (gotNVRAM) {
+            nvramFromController = true;  // Controller returns flat memory layout
+        }
+    }
+
+    // Check if we got NVRAM successfully
+    if (!gotNVRAM) {
+        LOGE("Failed to get NVRAM from PinMAME Controller for ROM: %s", currentRomName.c_str());
+        return;
+    }
+
+    // Extract high scores - reuse the already parsed mapRoot from above
+    // (mapRoot and charMap were already loaded when we read the platform)
 
     // Get high_scores array
     const JsonValue* highScores = mapRoot->get("high_scores");
@@ -1259,23 +1404,25 @@ void extractAndSaveHighScores(const char* eventName) {
         const JsonValue* initialsVal = entry->get("initials");
         const JsonValue* scoreVal = entry->get("score");
 
-        if (!labelVal || !initialsVal || !scoreVal) continue;
+        if (!labelVal || !scoreVal) continue;  // initials are optional
 
         std::string label = labelVal->strValue;
 
-        // Extract initials
-        const JsonValue* initStart = initialsVal->get("start");
-        const JsonValue* initLength = initialsVal->get("length");
-        const JsonValue* initEncoding = initialsVal->get("encoding");
-
-        if (!initStart || !initLength || !initEncoding) continue;
-
+        // Extract initials (optional)
         std::string initials;
-        size_t initStartAddr = parseStartAddress(initStart);
-        if (initEncoding->strValue == "ch") {
-            initials = decodeChar(nvramData, initStartAddr, initLength->numValue, charMap);
-        } else {
-            initials = "???";
+        if (initialsVal) {
+            const JsonValue* initStart = initialsVal->get("start");
+            const JsonValue* initLength = initialsVal->get("length");
+            const JsonValue* initEncoding = initialsVal->get("encoding");
+
+            if (initStart && initLength && initEncoding) {
+                size_t initStartAddr = parseStartAddress(initStart);
+                if (initEncoding->strValue == "ch") {
+                    initials = decodeChar(nvramData, initStartAddr, initLength->numValue, charMap);
+                } else {
+                    initials = "???";
+                }
+            }
         }
 
         // Extract score
@@ -1286,7 +1433,17 @@ void extractAndSaveHighScores(const char* eventName) {
         if (!scoreStart || !scoreLength || !scoreEncoding) continue;
 
         std::string score;
+        size_t rawScoreAddr = parseStartAddress(scoreStart, false);
         size_t scoreStartAddr = parseStartAddress(scoreStart);
+
+        // Debug log for first high score entry
+        static bool loggedHighScore = false;
+        if (!loggedHighScore) {
+            LOGI("High score address: raw=0x%zx, adjusted=0x%zx, length=%d, nvramSize=%zu",
+                 rawScoreAddr, scoreStartAddr, (int)scoreLength->numValue, nvramData.size());
+            loggedHighScore = true;
+        }
+
         if (scoreEncoding->strValue == "bcd") {
             score = decodeBCD(nvramData, scoreStartAddr, scoreLength->numValue);
         } else if (scoreEncoding->strValue == "int") {
@@ -1372,6 +1529,21 @@ void checkAndBroadcastCurrentScores() {
     const JsonValue* playerCountObj = gameState->get("player_count");
     int playerCount = decodeValue(liveNvram, playerCountObj);
 
+    // Debug: log NVRAM layout once when playerCount is 0
+    static bool loggedLayout = false;
+    if (!loggedLayout && playerCount == 0 && liveNvram.size() > 0) {
+        std::stringstream hexDump;
+        hexDump << "NVRAM at addresses 0x00-0x20: ";
+        for (size_t i = 0; i < std::min(liveNvram.size(), (size_t)32); i++) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02X ", liveNvram[i]);
+            hexDump << buf;
+        }
+        LOGI("%s", hexDump.str().c_str());
+        LOGI("Byte at 0x0C (playerCount addr): 0x%02X", liveNvram.size() > 0x0C ? liveNvram[0x0C] : 0xFF);
+        loggedLayout = true;
+    }
+
     const JsonValue* currentPlayerObj = gameState->get("current_player");
     int currentPlayer = decodeValue(liveNvram, currentPlayerObj);
 
@@ -1385,8 +1557,14 @@ void checkAndBroadcastCurrentScores() {
         return;
     }
 
+    // If playerCount is 0 (RAM address not accessible), default to all available score slots
+    if (playerCount == 0 && scores->arrayValue.size() > 0) {
+        playerCount = scores->arrayValue.size();
+    }
+
     // Extract current scores
     std::vector<std::string> currentScores;
+
     for (size_t i = 0; i < scores->arrayValue.size() && i < (size_t)playerCount; i++) {
         const JsonValue* scoreEntry = scores->at(i);
         if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) continue;
@@ -1399,6 +1577,7 @@ void checkAndBroadcastCurrentScores() {
 
         std::string score;
         size_t startAddr = parseStartAddress(startVal);
+
         if (encodingVal->strValue == "bcd") {
             score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
         } else if (encodingVal->strValue == "int") {
