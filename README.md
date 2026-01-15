@@ -3,7 +3,7 @@
 This plugin provides a WebSocket server that broadcasts high scores and live game scores in real-time for PinMAME games.
 <img width="1220" height="1068" alt="image" src="https://github.com/user-attachments/assets/aea04641-4be3-43cd-9f6f-6918671abce6" />
 
-
+Early prototype score dashboard: https://youtube.com/shorts/kHgwnBB_v2o
 
 ## Features
 
