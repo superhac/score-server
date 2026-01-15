@@ -132,6 +132,11 @@ Edit `make/CMakeLists_plugins.txt` and add:
 include("${CMAKE_SOURCE_DIR}/make/CMakeLists_plugin_ScoreServer.txt")
 ```
 
+Copy CMakeLists_plugin_ScoreServer.txt (when your inside the score-server dir)
+```
+cp CMakeLists_plugin_ScoreServer.txt ../../make/
+```
+
 ```
 cmake --build . --target ScoreServerPlugin
 ```
