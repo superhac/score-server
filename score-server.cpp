@@ -23,6 +23,7 @@
 // For JSON parsing - using a simple JSON parser approach
 #include <map>
 #include <set>
+#include <algorithm>
 
 // WebSocket support
 #ifdef _WIN32
@@ -337,16 +338,75 @@ void sendWebSocketFrame(SOCKET sock, const std::string& message) {
 // Broadcast to all WebSocket clients
 void broadcastWebSocket(const std::string& message) {
     std::lock_guard<std::mutex> lock(wsClientsMutex);
-    auto it = wsClients.begin();
-    while (it != wsClients.end()) {
-        if (send(*it, nullptr, 0, 0) == SOCKET_ERROR) {
-            // Client disconnected
-            closesocket(*it);
-            it = wsClients.erase(it);
-        } else {
-            sendWebSocketFrame(*it, message);
-            ++it;
+
+    // Early exit if no clients
+    if (wsClients.empty()) {
+        return;
+    }
+
+    // Build the frame once for all clients
+    std::vector<uint8_t> frame;
+    frame.push_back(0x81); // FIN + text frame
+
+    size_t len = message.size();
+    if (len < 126) {
+        frame.push_back(static_cast<uint8_t>(len));
+    } else if (len < 65536) {
+        frame.push_back(126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
         }
+    }
+
+    frame.insert(frame.end(), message.begin(), message.end());
+
+    // Send to all clients and collect dead ones
+    std::vector<SOCKET> deadSockets;
+
+    for (SOCKET client : wsClients) {
+        // Validate socket before sending
+        if (client == INVALID_SOCKET) {
+            deadSockets.push_back(client);
+            continue;
+        }
+
+        // Send with error checking - use MSG_NOSIGNAL on Unix to prevent SIGPIPE
+        int flags = 0;
+#ifndef _WIN32
+        flags = MSG_NOSIGNAL;
+#endif
+        int result = send(client, reinterpret_cast<const char*>(frame.data()), static_cast<int>(frame.size()), flags);
+
+        if (result == SOCKET_ERROR || result <= 0) {
+            // Client disconnected or error
+#ifdef _WIN32
+            int error = WSAGetLastError();
+            LOGI("Client send failed (WSAError: %d), marking for removal", error);
+#else
+            LOGI("Client send failed (errno: %d), marking for removal", errno);
+#endif
+            deadSockets.push_back(client);
+        }
+    }
+
+    // Remove dead clients outside the iteration
+    if (!deadSockets.empty()) {
+        // Sort and remove duplicates (in case same socket was marked dead multiple times)
+        std::sort(deadSockets.begin(), deadSockets.end());
+        deadSockets.erase(std::unique(deadSockets.begin(), deadSockets.end()), deadSockets.end());
+
+        for (SOCKET deadSocket : deadSockets) {
+            auto it = std::find(wsClients.begin(), wsClients.end(), deadSocket);
+            if (it != wsClients.end()) {
+                closesocket(*it);
+                wsClients.erase(it);
+            }
+        }
+        LOGI("Removed %zu disconnected client(s), %zu clients remain", deadSockets.size(), wsClients.size());
     }
 }
 
@@ -692,37 +752,72 @@ void webSocketServerThread() {
             socklen_t clientLen = sizeof(clientAddr);
             SOCKET clientSocket = accept(wsServerSocket, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
 
-            if (clientSocket != INVALID_SOCKET) {
-                LOGI("New WebSocket connection from %s", inet_ntoa(clientAddr.sin_addr));
+            if (clientSocket == INVALID_SOCKET) {
+                // Accept failed - log and continue
+#ifdef _WIN32
+                LOGW("accept() failed (WSAError: %d)", WSAGetLastError());
+#else
+                LOGW("accept() failed (errno: %d)", errno);
+#endif
+                continue;
+            }
 
-                // Set socket options for client connection
-                int opt = 1;
-                setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&opt), sizeof(opt));
+            LOGI("New WebSocket connection from %s", inet_ntoa(clientAddr.sin_addr));
 
-                // Set SO_LINGER to 0 for immediate close
-                linger clientLin{};
-                clientLin.l_onoff = 1;
-                clientLin.l_linger = 0;
-                setsockopt(clientSocket, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&clientLin), sizeof(clientLin));
+            bool handshakeSuccess = false;
 
-                // Set receive timeout to avoid hanging
-                timeval recvTimeout{};
-                recvTimeout.tv_sec = 5;  // 5 second timeout for handshake
-                recvTimeout.tv_usec = 0;
-                setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout));
+            // Set socket options for client connection
+            int opt = 1;
+            if (setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&opt), sizeof(opt)) != 0) {
+                LOGW("Failed to set TCP_NODELAY");
+            }
 
-                // Read HTTP upgrade request
-                char buffer[4096];
-                int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+            // Set SO_LINGER to 0 for immediate close
+            linger clientLin{};
+            clientLin.l_onoff = 1;
+            clientLin.l_linger = 0;
+            if (setsockopt(clientSocket, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&clientLin), sizeof(clientLin)) != 0) {
+                LOGW("Failed to set SO_LINGER");
+            }
+
+            // Set receive timeout to avoid hanging
+            timeval recvTimeout{};
+            recvTimeout.tv_sec = 5;  // 5 second timeout for handshake
+            recvTimeout.tv_usec = 0;
+            if (setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeout), sizeof(recvTimeout)) != 0) {
+                LOGW("Failed to set SO_RCVTIMEO");
+            }
+
+            // Read HTTP upgrade request (may need multiple recv calls for slow clients)
+            char buffer[4096] = {0};
+            int totalBytesRead = 0;
+            int bytesRead = 0;
+
+            // Read until we have the complete handshake (ends with \r\n\r\n)
+            do {
+                bytesRead = recv(clientSocket, buffer + totalBytesRead, sizeof(buffer) - totalBytesRead - 1, 0);
                 if (bytesRead > 0) {
-                    buffer[bytesRead] = '\0';
-                    std::string request(buffer);
+                    totalBytesRead += bytesRead;
+                    buffer[totalBytesRead] = '\0';
 
-                    // Extract Sec-WebSocket-Key
-                    size_t keyPos = request.find("Sec-WebSocket-Key: ");
-                    if (keyPos != std::string::npos) {
-                        keyPos += 19;
-                        size_t keyEnd = request.find("\r\n", keyPos);
+                    // Check if we have the complete handshake
+                    if (strstr(buffer, "\r\n\r\n") != nullptr) {
+                        break;
+                    }
+                } else {
+                    break;  // Error or connection closed
+                }
+            } while (totalBytesRead < (int)sizeof(buffer) - 1);
+
+            if (totalBytesRead > 0) {
+                std::string request(buffer);
+
+                // Extract Sec-WebSocket-Key
+                size_t keyPos = request.find("Sec-WebSocket-Key: ");
+                if (keyPos != std::string::npos) {
+                    keyPos += 19;
+                    size_t keyEnd = request.find("\r\n", keyPos);
+                    if (keyEnd != std::string::npos) {
                         std::string key = request.substr(keyPos, keyEnd - keyPos);
 
                         // Generate accept key
@@ -738,27 +833,42 @@ void webSocketServerThread() {
                             "Connection: Upgrade\r\n"
                             "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
 
-                        send(clientSocket, response.c_str(), response.length(), 0);
+                        int sendResult = send(clientSocket, response.c_str(), response.length(), 0);
+                        if (sendResult > 0) {
+                            // Add client to list
+                            size_t clientCount = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(wsClientsMutex);
+                                wsClients.push_back(clientSocket);
+                                clientCount = wsClients.size();
+                            }
 
-                        // Add client to list
-                        {
-                            std::lock_guard<std::mutex> lock(wsClientsMutex);
-                            wsClients.push_back(clientSocket);
+                            LOGI("WebSocket handshake completed, %zu clients connected", clientCount);
+                            handshakeSuccess = true;
+                        } else {
+                            LOGW("Failed to send WebSocket handshake response (result: %d)", sendResult);
                         }
-
-                        LOGI("WebSocket handshake completed, %zu clients connected", wsClients.size());
                     } else {
-                        LOGW("WebSocket handshake failed: no Sec-WebSocket-Key found");
-                        closesocket(clientSocket);
+                        LOGW("WebSocket handshake failed: malformed Sec-WebSocket-Key");
                     }
                 } else {
-                    if (bytesRead == 0) {
-                        LOGW("Client closed connection before sending handshake");
-                    } else {
-                        LOGW("Failed to receive WebSocket handshake (bytes: %d)", bytesRead);
-                    }
-                    closesocket(clientSocket);
+                    LOGW("WebSocket handshake failed: no Sec-WebSocket-Key found");
                 }
+            } else {
+                if (totalBytesRead == 0) {
+                    LOGW("Client closed connection before sending handshake");
+                } else {
+#ifdef _WIN32
+                    LOGW("Failed to receive WebSocket handshake (bytes: %d, WSAError: %d)", totalBytesRead, WSAGetLastError());
+#else
+                    LOGW("Failed to receive WebSocket handshake (bytes: %d, errno: %d)", totalBytesRead, errno);
+#endif
+                }
+            }
+
+            // Close socket if handshake failed
+            if (!handshakeSuccess) {
+                closesocket(clientSocket);
             }
         }
     }
