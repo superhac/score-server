@@ -1,6 +1,6 @@
 # Score Server Plugin
 
-This plugin provides a WebSocket server that broadcasts high scores and live game scores in real-time for PinMAME games.
+This plugin provides a WebSocket server that broadcasts high scores and live game scores in real-time for both PinMAME games and ROM-less tables.
 
 ## Features
 
@@ -8,12 +8,13 @@ This plugin provides a WebSocket server that broadcasts high scores and live gam
 - **Game lifecycle tracking** - sends game_start and game_end messages with timestamps
 - **Real-time current scores** - sends player scores, current player, and ball number as they change during gameplay
 - **High scores broadcast** - sends structured high scores with player initials when games start/end
+- **Badge/achievement system** - award and broadcast achievements in real-time
 - **Timestamps on all messages** - ISO 8601 format (UTC) for precise event tracking
 - **Change detection** - only broadcasts when game state actually changes (not time-based polling)
 - **Automatic reconnection** - clients automatically reconnect if connection is lost
 - **Structured JSON output** - all messages sent as structured JSON
-- Automatically detects the ROM being played
-- Uses the [pinmame-nvram-maps](https://github.com/tomlogic/pinmame-nvram-maps) project to decode NVRAM data
+- **ROM-less table support** - scriptable API for tables without PinMAME ROMs
+- **PinMAME integration** - automatically detects ROM being played and uses [pinmame-nvram-maps](https://github.com/tomlogic/pinmame-nvram-maps) to decode NVRAM data
 - **Includes bundled NVRAM maps** - supports 628+ ROMs out of the box!
 
 ## Requirements
@@ -31,6 +32,8 @@ The plugin starts a WebSocket server on port **3131** that listens on all networ
 
 ### Game Flow
 
+**For PinMAME Games:**
+
 1. **On game start**:
    - Plugin captures the ROM name
    - Reads NVRAM from PinMAME Controller (live memory access)
@@ -46,9 +49,18 @@ The plugin starts a WebSocket server on port **3131** that listens on all networ
 3. **On game end**:
    - Broadcasts final high scores
 
+**For ROM-less Tables:**
+
+Tables can use the scriptable API to push score data directly:
+- Call `SetGameName()` to identify the table
+- Call `SetScoresArray()` to broadcast current scores
+- Call `SetHighScoresArray()` to broadcast high scores
+- Call `AwardBadge()` to send achievement events
+- See [TABLE_INTEGRATION.md](TABLE_INTEGRATION.md) for complete documentation
+
 ### Message Types
 
-The plugin sends four types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC).
+The plugin sends five types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC).
 
 #### Game Start
 Sent when a new game begins.
@@ -100,6 +112,40 @@ Sent whenever game state changes during active play.
     {"player": "Player 2", "score": "987654321"}
   ]
 }
+```
+
+#### Badge/Achievement
+Sent when a badge or achievement is awarded (ROM-less tables only).
+```json
+{
+  "type": "badge",
+  "timestamp": "2026-01-15T12:40:15.789Z",
+  "rom": "MyAwesomeTable",
+  "player": "Player 1",
+  "name": "Millionaire",
+  "description": "Scored over 1,000,000 points"
+}
+```
+
+## ROM-less Table Integration
+
+For tables that don't use PinMAME ROMs, you can use the scriptable API to broadcast scores. See [TABLE_INTEGRATION.md](TABLE_INTEGRATION.md) for a complete guide with examples.
+
+Quick example:
+```vbscript
+Sub Table_Init()
+    Dim Server
+    Set Server = CreateObject("VPinball.ScoreServer")
+    Server.SetGameName "MyTable_v1.0"
+End Sub
+
+Sub AddScore(points)
+    Score(CurrentPlayer) = Score(CurrentPlayer) + points
+
+    Dim Server
+    Set Server = CreateObject("VPinball.ScoreServer")
+    Server.SetScoresArray Join(playerNames, "|"), Join(scores, "|")
+End Sub
 ```
 
 ## Test Client
@@ -211,6 +257,11 @@ ws.onmessage = (event) => {
       console.log(`  ${entry.label}: ${entry.initials} - ${entry.score}`);
     });
   }
+
+  if (data.type === 'badge') {
+    console.log(`[${data.timestamp}] 🏆 ${data.player} - Achievement unlocked: ${data.name}`);
+    console.log(`  ${data.description}`);
+  }
 };
 ```
 
@@ -237,6 +288,10 @@ def on_message(ws, message):
         print(f"[{data['timestamp']}] High Scores for {data['rom']}:")
         for entry in data['scores']:
             print(f"  {entry['label']}: {entry['initials']} - {entry['score']}")
+
+    elif data['type'] == 'badge':
+        print(f"[{data['timestamp']}] 🏆 {data['player']} - Achievement unlocked: {data['name']}")
+        print(f"  {data['description']}")
 
 ws = websocket.WebSocketApp('ws://192.168.1.100:3131',
                            on_message=on_message)

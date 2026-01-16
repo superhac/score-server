@@ -80,6 +80,9 @@
         .message.game-end {
             border-left-color: #c586c0;
         }
+        .message.badge {
+            border-left-color: #d7ba7d;
+        }
         .message-type {
             font-weight: bold;
             color: #569cd6;
@@ -151,7 +154,9 @@
     <script>
         let ws = null;
         let reconnectTimer = null;
+        let connectionTimeout = null;
         let manualDisconnect = false;
+        const RECONNECT_DELAY = 500; // Hammer it every 500ms
         const statusDiv = document.getElementById('status');
         const messagesDiv = document.getElementById('messages');
         const rawJsonDiv = document.getElementById('rawJson');
@@ -209,6 +214,10 @@
                     content += `  ${scoreObj.player}: ${scoreObj.score}\n`;
                 });
                 content += `</div>`;
+            } else if (type === 'badge') {
+                content += `<div class="message-data">`;
+                content += `🏆 ${data.player} - ${data.name}: ${data.description}`;
+                content += `</div>`;
             }
 
             messageDiv.innerHTML = content;
@@ -235,10 +244,14 @@
         }
 
         function connect() {
-            // Clear any existing reconnect timer
+            // Clear any existing timers
             if (reconnectTimer) {
                 clearTimeout(reconnectTimer);
                 reconnectTimer = null;
+            }
+            if (connectionTimeout) {
+                clearTimeout(connectionTimeout);
+                connectionTimeout = null;
             }
 
             // Don't try to connect if already connected or connecting
@@ -250,8 +263,26 @@
                 updateStatus(false, true); // Show "Connecting..."
                 ws = new WebSocket('ws://192.168.1.228:3131');
 
+                // Set a timeout for connection attempt (1 second for fast retry)
+                connectionTimeout = setTimeout(() => {
+                    if (ws && ws.readyState === WebSocket.CONNECTING) {
+                        console.log('Connection timeout - closing stale connection');
+                        ws.close();
+                        ws = null;
+                        updateStatus(false);
+
+                        // Auto-reconnect immediately
+                        if (!manualDisconnect) {
+                            console.log(`Will retry connection in ${RECONNECT_DELAY}ms...`);
+                            reconnectTimer = setTimeout(connect, RECONNECT_DELAY);
+                        }
+                    }
+                }, 1000); // 1 second timeout for faster detection
+
                 ws.onopen = () => {
                     console.log('WebSocket connected');
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
                     updateStatus(true);
                     messagesDiv.innerHTML = '<div style="color: #4ec9b0;">Connected! Waiting for score data...</div>';
                     rawJsonDiv.innerHTML = '<div style="color: #4ec9b0;">Connected! Waiting for messages...</div>';
@@ -274,6 +305,8 @@
                             addMessage('high-scores', data);
                         } else if (data.type === 'current_scores') {
                             addMessage('current-scores', data);
+                        } else if (data.type === 'badge') {
+                            addMessage('badge', data);
                         } else {
                             addMessage('unknown', data);
                         }
@@ -285,26 +318,31 @@
 
                 ws.onerror = (error) => {
                     console.error('WebSocket error:', error);
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
                 };
 
                 ws.onclose = () => {
                     console.log('WebSocket disconnected');
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
                     updateStatus(false);
                     ws = null;
 
-                    // Auto-reconnect if not manually disconnected
+                    // Auto-reconnect immediately
                     if (!manualDisconnect) {
-                        console.log('Will retry connection in 1 second...');
-                        reconnectTimer = setTimeout(connect, 1000);
+                        console.log(`Will retry connection in ${RECONNECT_DELAY}ms...`);
+                        reconnectTimer = setTimeout(connect, RECONNECT_DELAY);
                     }
                 };
             } catch (e) {
                 console.error('Failed to connect:', e);
                 ws = null;
 
-                // Auto-reconnect on error if not manually disconnected
+                // Auto-reconnect immediately
                 if (!manualDisconnect) {
-                    reconnectTimer = setTimeout(connect, 1000);
+                    console.log(`Will retry connection in ${RECONNECT_DELAY}ms...`);
+                    reconnectTimer = setTimeout(connect, RECONNECT_DELAY);
                 }
             }
         }
@@ -312,10 +350,14 @@
         function disconnect() {
             manualDisconnect = true;
 
-            // Clear reconnect timer
+            // Clear all timers
             if (reconnectTimer) {
                 clearTimeout(reconnectTimer);
                 reconnectTimer = null;
+            }
+            if (connectionTimeout) {
+                clearTimeout(connectionTimeout);
+                connectionTimeout = null;
             }
 
             if (ws) {

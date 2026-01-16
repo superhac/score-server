@@ -109,6 +109,95 @@ std::string getTimestamp() {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Forward declarations
+void broadcastWebSocket(const std::string& message);
+
+///////////////////////////////////////////////////////////////////////////////
+// Scriptable table state (for ROM-less tables)
+
+struct TableScore {
+    int player;
+    std::string score;
+    int ball;
+};
+
+struct TableHighScore {
+    std::string label;
+    std::string initials;
+    std::string score;
+};
+
+std::vector<TableScore> tableScores;
+std::vector<TableHighScore> tableHighScores;
+std::string tableGameName;  // For ROM-less tables
+int tablePlayerCount = 0;
+int tableCurrentPlayer = 0;
+int tableCurrentBall = 0;
+std::mutex tableStateMutex;  // Protect table state from concurrent access
+
+// Broadcast table scores via WebSocket
+void broadcastTableScores() {
+    std::lock_guard<std::mutex> lock(tableStateMutex);
+    if (tableGameName.empty()) return;
+
+    std::stringstream jsonOutput;
+    jsonOutput << "{\"type\":\"current_scores\","
+               << "\"timestamp\":\"" << getTimestamp() << "\","
+               << "\"rom\":\"" << tableGameName << "\","
+               << "\"players\":" << tablePlayerCount << ","
+               << "\"current_player\":" << tableCurrentPlayer << ","
+               << "\"current_ball\":" << tableCurrentBall << ","
+               << "\"scores\":[";
+
+    for (size_t i = 0; i < tableScores.size(); i++) {
+        if (i > 0) jsonOutput << ",";
+        jsonOutput << "{\"player\":\"Player " << tableScores[i].player << "\","
+                   << "\"score\":\"" << tableScores[i].score << "\"}";
+    }
+
+    jsonOutput << "]}";
+    broadcastWebSocket(jsonOutput.str());
+}
+
+// Broadcast table high scores via WebSocket
+void broadcastTableHighScores() {
+    std::lock_guard<std::mutex> lock(tableStateMutex);
+    if (tableGameName.empty()) return;
+
+    std::stringstream jsonOutput;
+    jsonOutput << "{\"type\":\"high_scores\","
+               << "\"timestamp\":\"" << getTimestamp() << "\","
+               << "\"rom\":\"" << tableGameName << "\","
+               << "\"scores\":[";
+
+    for (size_t i = 0; i < tableHighScores.size(); i++) {
+        if (i > 0) jsonOutput << ",";
+        jsonOutput << "{\"label\":\"" << tableHighScores[i].label << "\","
+                   << "\"initials\":\"" << tableHighScores[i].initials << "\","
+                   << "\"score\":\"" << tableHighScores[i].score << "\"}";
+    }
+
+    jsonOutput << "]}";
+    broadcastWebSocket(jsonOutput.str());
+}
+
+// Broadcast a single badge via WebSocket
+void broadcastBadge(const std::string& player, const std::string& name, const std::string& description) {
+    std::lock_guard<std::mutex> lock(tableStateMutex);
+    if (tableGameName.empty()) return;
+
+    std::stringstream jsonOutput;
+    jsonOutput << "{\"type\":\"badge\","
+               << "\"timestamp\":\"" << getTimestamp() << "\","
+               << "\"rom\":\"" << tableGameName << "\","
+               << "\"player\":\"" << player << "\","
+               << "\"name\":\"" << name << "\","
+               << "\"description\":\"" << description << "\"}";
+
+    broadcastWebSocket(jsonOutput.str());
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // WebSocket implementation
 
 // Base64 encoding for WebSocket handshake
@@ -1726,6 +1815,157 @@ void onPrepareFrame(const unsigned int eventId, void* userData, void* eventData)
     checkAndBroadcastCurrentScores();
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Scriptable COM object for table scripts
+
+class ScoreServerClass {
+public:
+    // Reference counting (required by ScriptablePlugin API)
+    // Since this is a singleton, we don't actually delete it
+    uint32_t AddRef() { return ++refCount; }
+    uint32_t Release() { return --refCount; }
+
+    // Set game name (must be called first, usually in Table_Init)
+    void SetGameName(const std::string& gameName) {
+        std::lock_guard<std::mutex> lock(tableStateMutex);
+        tableGameName = gameName;
+        LOGI("Table game name set to: %s", gameName.c_str());
+
+        // Send game_start message
+        std::stringstream gameStartMsg;
+        gameStartMsg << "{\"type\":\"game_start\","
+                     << "\"timestamp\":\"" << getTimestamp() << "\","
+                     << "\"rom\":\"" << tableGameName << "\"}";
+        broadcastWebSocket(gameStartMsg.str());
+    }
+
+    // Set game state
+    void SetGameState(int playerCount, int currentPlayer, int currentBall) {
+        {
+            std::lock_guard<std::mutex> lock(tableStateMutex);
+            tablePlayerCount = playerCount;
+            tableCurrentPlayer = currentPlayer;
+            tableCurrentBall = currentBall;
+        }
+        broadcastTableScores();
+    }
+
+    // Helper to split string by delimiter
+    std::vector<std::string> splitString(const std::string& str, const std::string& delimiter) {
+        std::vector<std::string> result;
+        size_t start = 0;
+        size_t end = str.find(delimiter);
+
+        while (end != std::string::npos) {
+            result.push_back(str.substr(start, end - start));
+            start = end + delimiter.length();
+            end = str.find(delimiter, start);
+        }
+        result.push_back(str.substr(start));
+        return result;
+    }
+
+    // Set all current scores at once using delimited strings
+    // Usage: Server.SetScoresArray Join(players, "|"), Join(scores, "|")
+    void SetScoresArray(const std::string& playersStr, const std::string& scoresStr) {
+        {
+            std::lock_guard<std::mutex> lock(tableStateMutex);
+            // Clear existing scores
+            tableScores.clear();
+
+            // Split by | delimiter
+            auto players = splitString(playersStr, "|");
+            auto scores = splitString(scoresStr, "|");
+
+            // Get the minimum count
+            size_t count = players.size();
+            if (scores.size() < count) count = scores.size();
+
+            // Add all scores
+            for (size_t i = 0; i < count; i++) {
+                // Try to extract player number from player string (e.g., "Player 1" -> 1)
+                int playerNum = static_cast<int>(i + 1);
+                tableScores.push_back({playerNum, scores[i], tableCurrentBall});
+            }
+        }
+
+        // Broadcast updated scores
+        broadcastTableScores();
+    }
+
+    // Set all high scores at once using delimited strings
+    // Usage: Server.SetHighScoresArray Join(labels, "|"), Join(initials, "|"), Join(scores, "|")
+    void SetHighScoresArray(const std::string& labelsStr, const std::string& initialsStr, const std::string& scoresStr) {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(tableStateMutex);
+                // Clear existing high scores
+                tableHighScores.clear();
+
+                // Split by | delimiter
+                auto labels = splitString(labelsStr, "|");
+                auto initials = splitString(initialsStr, "|");
+                auto scores = splitString(scoresStr, "|");
+
+                // Get the minimum count
+                size_t count = labels.size();
+                if (initials.size() < count) count = initials.size();
+                if (scores.size() < count) count = scores.size();
+
+                // Skip if no data
+                if (count == 0) {
+                    LOGI("SetHighScoresArray: no high scores to set");
+                    return;
+                }
+
+                // Add all high scores
+                for (size_t i = 0; i < count; i++) {
+                    tableHighScores.push_back({labels[i], initials[i], scores[i]});
+                }
+            }
+
+            // Broadcast once (outside the lock to avoid deadlock)
+            broadcastTableHighScores();
+        } catch (const std::exception& e) {
+            LOGE("SetHighScoresArray failed: %s", e.what());
+        } catch (...) {
+            LOGE("SetHighScoresArray failed with unknown error");
+        }
+    }
+
+    // Award a badge/achievement
+    void AwardBadge(const std::string& player, const std::string& name, const std::string& description) {
+        broadcastBadge(player, name, description);  // Just forward the badge event
+        LOGI("Badge awarded to %s: %s - %s", player.c_str(), name.c_str(), description.c_str());
+    }
+
+    // Clear all table state (call on game end)
+    void ClearState() {
+        std::lock_guard<std::mutex> lock(tableStateMutex);
+        tableScores.clear();
+        tableHighScores.clear();
+        tablePlayerCount = 0;
+        tableCurrentPlayer = 0;
+        tableCurrentBall = 0;
+    }
+
+private:
+    uint32_t refCount = 1;
+};
+
+// Singleton instance
+static ScoreServerClass scoreServerInstance;
+
+// Register the scriptable class
+PSC_CLASS_START(ScoreServerClass)
+    PSC_FUNCTION1(ScoreServerClass, void, SetGameName, string)
+    PSC_FUNCTION3(ScoreServerClass, void, SetGameState, int, int, int)
+    PSC_FUNCTION2(ScoreServerClass, void, SetScoresArray, string, string)
+    PSC_FUNCTION3(ScoreServerClass, void, SetHighScoresArray, string, string, string)
+    PSC_FUNCTION3(ScoreServerClass, void, AwardBadge, string, string, string)
+    PSC_FUNCTION0(ScoreServerClass, void, ClearState)
+PSC_CLASS_END(ScoreServerClass)
+
 } // namespace ScoreServer
 
 using namespace ScoreServer;
@@ -1763,6 +2003,21 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
     msgApi->BroadcastMsg(endpointId, getScriptApiId = msgApi->GetMsgID(SCRIPTPI_NAMESPACE, SCRIPTPI_MSG_GET_API), &scriptApi);
     if (scriptApi) {
         LOGI("ScriptablePlugin API obtained successfully");
+
+        // Register the ScoreServerClass scriptable class so table scripts can call it
+        RegisterScoreServerClassSCD([&](ScriptClassDef* classDef) {
+            // Override the CreateObject to return our singleton instance
+            classDef->CreateObject = []() -> void* {
+                return &scoreServerInstance;
+            };
+            scriptApi->RegisterScriptClass(classDef);
+
+            // Register COM object override so CreateObject("VPinball.ScoreServer") works
+            scriptApi->SetCOMObjectOverride("VPinball.ScoreServer", classDef);
+        });
+        scriptApi->SubmitTypeLibrary();
+
+        LOGI("ScoreServerClass registered - tables can now use CreateObject(\"VPinball.ScoreServer\")");
     } else {
         LOGW("ScriptablePlugin API not available - will fall back to disk-based NVRAM reading");
     }
@@ -1849,6 +2104,11 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
     msgApi->ReleaseMsgID(onGameStartId);
     msgApi->ReleaseMsgID(onGameEndId);
     msgApi->ReleaseMsgID(onPrepareFrameId);
+
+    // Unregister COM object override
+    if (scriptApi) {
+        scriptApi->SetCOMObjectOverride("VPinball.ScoreServer", nullptr);
+    }
 
     vpxApi = nullptr;
     scriptApi = nullptr;
