@@ -2,6 +2,9 @@
 
 This plugin provides a WebSocket server that broadcasts high scores and live game scores in real-time for both PinMAME games and ROM-less tables.
 
+<img width="1215" height="1063" alt="image" src="https://github.com/user-attachments/assets/ba2f07bf-4850-4fed-9032-f82dca1a634b" />
+
+Prototype videos in action: [rom based](https://www.youtube.com/shorts/ERsjBmrbnQw), [non-rom + awards](https://www.youtube.com/shorts/ERsjBmrbnQw)
 ## Features
 
 - **WebSocket server on port 3131** - broadcasts scores to connected clients in real-time
