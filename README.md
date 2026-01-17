@@ -63,7 +63,7 @@ Tables can use the scriptable API to push score data directly:
 
 ### Message Types
 
-The plugin sends five types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC).
+The plugin sends five types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC). If `MachineId` is configured, all messages will also include a `machine_id` field identifying which machine the message originated from.
 
 #### Game Start
 Sent when a new game begins.
@@ -71,9 +71,11 @@ Sent when a new game begins.
 {
   "type": "game_start",
   "timestamp": "2026-01-15T12:34:56.789Z",
-  "rom": "mm_109"
+  "rom": "mm_109",
+  "machine_id": "Cabinet1"
 }
 ```
+*Note: The `machine_id` field is only present if configured in VPinballX.ini*
 
 #### Game End
 Sent when a game ends.
@@ -81,7 +83,8 @@ Sent when a game ends.
 {
   "type": "game_end",
   "timestamp": "2026-01-15T12:45:30.123Z",
-  "rom": "mm_109"
+  "rom": "mm_109",
+  "machine_id": "Cabinet1"
 }
 ```
 
@@ -92,6 +95,7 @@ Sent on game start and game end with the current high score table.
   "type": "high_scores",
   "timestamp": "2026-01-15T12:34:56.890Z",
   "rom": "mm_109",
+  "machine_id": "Cabinet1",
   "scores": [
     {"label": "Grand Champion", "initials": "WTH", "score": "3000000000"},
     {"label": "First Place", "initials": "ABC", "score": "1500000000"},
@@ -107,6 +111,7 @@ Sent whenever game state changes during active play.
   "type": "current_scores",
   "timestamp": "2026-01-15T12:35:20.456Z",
   "rom": "afm_113b",
+  "machine_id": "Cabinet1",
   "players": 2,
   "current_player": 1,
   "current_ball": 2,
@@ -124,6 +129,7 @@ Sent when a badge or achievement is awarded (ROM-less tables only).
   "type": "badge",
   "timestamp": "2026-01-15T12:40:15.789Z",
   "rom": "MyAwesomeTable",
+  "machine_id": "Cabinet1",
   "player": "Player 1",
   "name": "Millionaire",
   "description": "Scored over 1,000,000 points"
@@ -205,11 +211,20 @@ cmake --build . --target ScoreServerPlugin
 
 The plugin will be installed to the `plugins/score-server/` directory.
 
-## Configure your VPinballX.ini (enable the plugin)
-```
+## Configuration
+
+Configure the plugin in your `VPinballX.ini` file:
+
+```ini
 [Plugin.ScoreServer]
 Enable = 1
+MachineId = MyPinballCabinet
 ```
+
+### Configuration Options
+
+- **Enable** (required): Set to `1` to enable the plugin
+- **MachineId** (optional): A unique identifier for this machine. When set, all WebSocket messages will include a `machine_id` field to identify which cabinet the message originated from. This is useful when broadcasting scores from multiple machines to the same client.
 
 ## Network Configuration
 
@@ -244,30 +259,33 @@ const ws = new WebSocket('ws://192.168.1.100:3131');
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
 
+  // Optional: Check which machine sent this message
+  const machine = data.machine_id ? `[${data.machine_id}] ` : '';
+
   if (data.type === 'game_start') {
-    console.log(`[${data.timestamp}] Game started: ${data.rom}`);
+    console.log(`${machine}[${data.timestamp}] Game started: ${data.rom}`);
   }
 
   if (data.type === 'game_end') {
-    console.log(`[${data.timestamp}] Game ended: ${data.rom}`);
+    console.log(`${machine}[${data.timestamp}] Game ended: ${data.rom}`);
   }
 
   if (data.type === 'current_scores') {
-    console.log(`[${data.timestamp}] ${data.rom}: Player ${data.current_player} - Ball ${data.current_ball}`);
+    console.log(`${machine}[${data.timestamp}] ${data.rom}: Player ${data.current_player} - Ball ${data.current_ball}`);
     data.scores.forEach(score => {
       console.log(`  ${score.player}: ${score.score}`);
     });
   }
 
   if (data.type === 'high_scores') {
-    console.log(`[${data.timestamp}] High Scores for ${data.rom}:`);
+    console.log(`${machine}[${data.timestamp}] High Scores for ${data.rom}:`);
     data.scores.forEach(entry => {
       console.log(`  ${entry.label}: ${entry.initials} - ${entry.score}`);
     });
   }
 
   if (data.type === 'badge') {
-    console.log(`[${data.timestamp}] 🏆 ${data.player} - Achievement unlocked: ${data.name}`);
+    console.log(`${machine}[${data.timestamp}] 🏆 ${data.player} - Achievement unlocked: ${data.name}`);
     console.log(`  ${data.description}`);
   }
 };
@@ -281,24 +299,27 @@ import json
 def on_message(ws, message):
     data = json.loads(message)
 
+    # Optional: Check which machine sent this message
+    machine = f"[{data['machine_id']}] " if 'machine_id' in data else ''
+
     if data['type'] == 'game_start':
-        print(f"[{data['timestamp']}] Game started: {data['rom']}")
+        print(f"{machine}[{data['timestamp']}] Game started: {data['rom']}")
 
     elif data['type'] == 'game_end':
-        print(f"[{data['timestamp']}] Game ended: {data['rom']}")
+        print(f"{machine}[{data['timestamp']}] Game ended: {data['rom']}")
 
     elif data['type'] == 'current_scores':
-        print(f"[{data['timestamp']}] {data['rom']}: Player {data['current_player']} - Ball {data['current_ball']}")
+        print(f"{machine}[{data['timestamp']}] {data['rom']}: Player {data['current_player']} - Ball {data['current_ball']}")
         for score in data['scores']:
             print(f"  {score['player']}: {score['score']}")
 
     elif data['type'] == 'high_scores':
-        print(f"[{data['timestamp']}] High Scores for {data['rom']}:")
+        print(f"{machine}[{data['timestamp']}] High Scores for {data['rom']}:")
         for entry in data['scores']:
             print(f"  {entry['label']}: {entry['initials']} - {entry['score']}")
 
     elif data['type'] == 'badge':
-        print(f"[{data['timestamp']}] 🏆 {data['player']} - Achievement unlocked: {data['name']}")
+        print(f"{machine}[{data['timestamp']}] 🏆 {data['player']} - Achievement unlocked: {data['name']}")
         print(f"  {data['description']}")
 
 ws = websocket.WebSocketApp('ws://192.168.1.100:3131',

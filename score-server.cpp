@@ -60,6 +60,9 @@ ScriptablePluginAPI* scriptApi = nullptr;
 uint32_t endpointId;
 unsigned int getVpxApiId, getScriptApiId, getControllerId, onGameEndId, onGameStartId, onPrepareFrameId;
 
+// Plugin settings
+MSGPI_STRING_VAL_SETTING(machineIdProp, "MachineId", "Machine ID", "Unique identifier for this machine", false, "", 256);
+
 std::string currentRomName;
 std::string nvramMapsPath;
 std::string currentMapPath;
@@ -120,6 +123,15 @@ std::string getTimestamp() {
 // Forward declarations
 void broadcastWebSocket(const std::string& message);
 
+// Helper to add machine_id field to JSON messages if configured
+std::string addMachineIdField() {
+    const char* machineId = machineIdProp_Get();
+    if (machineId && machineId[0] != '\0') {
+        return std::string(",\"machine_id\":\"") + machineId + "\"";
+    }
+    return "";
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Scriptable table state (for ROM-less tables)
 
@@ -151,7 +163,8 @@ void broadcastTableScores() {
     std::stringstream jsonOutput;
     jsonOutput << "{\"type\":\"current_scores\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
-               << "\"rom\":\"" << tableGameName << "\","
+               << "\"rom\":\"" << tableGameName << "\""
+               << addMachineIdField() << ","
                << "\"players\":" << tablePlayerCount << ","
                << "\"current_player\":" << tableCurrentPlayer << ","
                << "\"current_ball\":" << tableCurrentBall << ","
@@ -175,7 +188,8 @@ void broadcastTableHighScores() {
     std::stringstream jsonOutput;
     jsonOutput << "{\"type\":\"high_scores\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
-               << "\"rom\":\"" << tableGameName << "\","
+               << "\"rom\":\"" << tableGameName << "\""
+               << addMachineIdField() << ","
                << "\"scores\":[";
 
     for (size_t i = 0; i < tableHighScores.size(); i++) {
@@ -197,7 +211,8 @@ void broadcastBadge(const std::string& player, const std::string& name, const st
     std::stringstream jsonOutput;
     jsonOutput << "{\"type\":\"badge\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
-               << "\"rom\":\"" << tableGameName << "\","
+               << "\"rom\":\"" << tableGameName << "\""
+               << addMachineIdField() << ","
                << "\"player\":\"" << player << "\","
                << "\"name\":\"" << name << "\","
                << "\"description\":\"" << description << "\"}";
@@ -1428,7 +1443,8 @@ void extractAndLogCurrentScores() {
     std::stringstream jsonOutput;
     jsonOutput << "{\"type\":\"current_scores\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
-               << "\"rom\":\"" << currentRomName << "\","
+               << "\"rom\":\"" << currentRomName << "\""
+               << addMachineIdField() << ","
                << "\"players\":" << playerCount << ","
                << "\"current_player\":" << currentPlayer << ","
                << "\"current_ball\":" << currentBall << ","
@@ -1775,7 +1791,8 @@ void extractAndSaveHighScores(const char* eventName) {
     std::stringstream jsonOutput;
     jsonOutput << "{\"type\":\"high_scores\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
-               << "\"rom\":\"" << currentRomName << "\","
+               << "\"rom\":\"" << currentRomName << "\""
+               << addMachineIdField() << ","
                << "\"scores\":[";
 
     // Also build text output for logging
@@ -2043,7 +2060,8 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
         std::stringstream gameStartMsg;
         gameStartMsg << "{\"type\":\"game_start\","
                      << "\"timestamp\":\"" << getTimestamp() << "\","
-                     << "\"rom\":\"" << currentRomName << "\"}";
+                     << "\"rom\":\"" << currentRomName << "\""
+                     << addMachineIdField() << "}";
         broadcastWebSocket(gameStartMsg.str());
 
         // Clear previous NVRAM data
@@ -2076,7 +2094,8 @@ void onGameEnd(const unsigned int eventId, void* userData, void* eventData) {
     std::stringstream gameEndMsg;
     gameEndMsg << "{\"type\":\"game_end\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
-               << "\"rom\":\"" << currentRomName << "\"}";
+               << "\"rom\":\"" << currentRomName << "\""
+               << addMachineIdField() << "}";
     broadcastWebSocket(gameEndMsg.str());
 
     extractAndSaveHighScores("Game end");
@@ -2110,7 +2129,8 @@ public:
         std::stringstream gameStartMsg;
         gameStartMsg << "{\"type\":\"game_start\","
                      << "\"timestamp\":\"" << getTimestamp() << "\","
-                     << "\"rom\":\"" << tableGameName << "\"}";
+                     << "\"rom\":\"" << tableGameName << "\""
+                     << addMachineIdField() << "}";
         broadcastWebSocket(gameStartMsg.str());
     }
 
@@ -2271,6 +2291,9 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
     LOGI("Score Server Plugin loaded");
     LOGI("NVRAM Maps Path: %s", nvramMapsPath.c_str());
 
+    // Register plugin settings
+    msgApi->RegisterSetting(endpointId, &machineIdProp);
+
     // Get VPX API
     msgApi->BroadcastMsg(endpointId, getVpxApiId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_API), &vpxApi);
 
@@ -2332,7 +2355,8 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
         std::stringstream gameEndMsg;
         gameEndMsg << "{\"type\":\"game_end\","
                    << "\"timestamp\":\"" << getTimestamp() << "\","
-                   << "\"rom\":\"" << currentRomName << "\"}";
+                   << "\"rom\":\"" << currentRomName << "\""
+                   << addMachineIdField() << "}";
         broadcastWebSocket(gameEndMsg.str());
 
         // Give a brief moment for the message to be sent
