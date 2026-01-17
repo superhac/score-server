@@ -79,6 +79,7 @@ int previousPlayerCount = 0;
 int previousCurrentPlayer = 0;
 int previousCurrentBall = 0;
 
+
 // WebSocket server
 std::atomic<bool> wsServerRunning{false};
 std::thread wsServerThread;
@@ -890,6 +891,9 @@ void webSocketServerThread() {
     LOGI("WebSocket server thread stopped");
 }
 
+// Forward declaration
+size_t parseStartAddress(const JsonValue* startVal, bool adjustForBase = true);
+
 // Decode BCD (Binary-Coded Decimal) from NVRAM bytes
 std::string decodeBCD(const std::vector<uint8_t>& nvram, size_t start, size_t length) {
     if (start + length > nvram.size()) {
@@ -915,6 +919,33 @@ std::string decodeBCD(const std::vector<uint8_t>& nvram, size_t start, size_t le
             if (high <= 9) result << (char)('0' + high);
             if (low <= 9) result << (char)('0' + low);
         }
+    }
+
+    return result.str();
+}
+
+// Decode BCD from array of offsets (used by some map files like gnr_300)
+// Reads one byte from each offset in the array
+std::string decodeBCDFromOffsets(const std::vector<uint8_t>& nvram, const JsonValue* offsetsArray) {
+    if (!offsetsArray || offsetsArray->type != JsonValue::ARRAY) {
+        return "ERROR";
+    }
+
+    std::stringstream result;
+
+    // Read each offset in order
+    for (size_t i = 0; i < offsetsArray->arrayValue.size(); i++) {
+        const JsonValue* offsetVal = offsetsArray->at(i);
+        if (!offsetVal) continue;
+
+        size_t offset = parseStartAddress(offsetVal);
+        if (offset >= nvram.size()) continue;
+
+        uint8_t byte = nvram[offset];
+        uint8_t high = (byte >> 4) & 0x0F;
+        uint8_t low = byte & 0x0F;
+        if (high <= 9) result << (char)('0' + high);
+        if (low <= 9) result << (char)('0' + low);
     }
 
     return result.str();
@@ -952,7 +983,7 @@ std::string decodeChar(const std::vector<uint8_t>& nvram, size_t start, size_t l
 
 // Helper function to parse start address from JSON (handles both hex strings and numbers)
 // If adjustForBase is true, subtracts nvramBaseAddress to get offset into NVRAM data
-size_t parseStartAddress(const JsonValue* startVal, bool adjustForBase = true) {
+size_t parseStartAddress(const JsonValue* startVal, bool adjustForBase) {
     if (!startVal) {
         return 0;
     }
@@ -1212,32 +1243,44 @@ void extractAndLogCurrentScores() {
                 continue;
             }
 
+            const JsonValue* encodingVal = scoreEntry->get("encoding");
+            const JsonValue* offsetsVal = scoreEntry->get("offsets");
             const JsonValue* startVal = scoreEntry->get("start");
             const JsonValue* lengthVal = scoreEntry->get("length");
-            const JsonValue* encodingVal = scoreEntry->get("encoding");
-
-            if (!startVal || !lengthVal || !encodingVal) {
-                allScores.push_back("");
-                continue;
-            }
 
             std::string score;
-            size_t startAddr = parseStartAddress(startVal);
-            if (encodingVal->strValue == "bcd") {
-                score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
-            } else if (encodingVal->strValue == "int") {
-                uint64_t value = 0;
-                size_t len = lengthVal->numValue;
-                if (startAddr + len <= liveNvram.size()) {
-                    for (size_t j = 0; j < len; j++) {
-                        value = (value << 8) | liveNvram[startAddr + j];
-                    }
-                    score = std::to_string(value);
+
+            // Check if using offsets array format (e.g., gnr_300)
+            if (offsetsVal && offsetsVal->type == JsonValue::ARRAY && encodingVal) {
+                if (encodingVal->strValue == "bcd") {
+                    score = decodeBCDFromOffsets(liveNvram, offsetsVal);
                 } else {
-                    score = "ERROR";
+                    score = "???";
+                }
+            }
+            // Traditional start+length format
+            else if (startVal && lengthVal && encodingVal) {
+                size_t startAddr = parseStartAddress(startVal);
+                if (encodingVal->strValue == "bcd") {
+                    score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
+                } else if (encodingVal->strValue == "int") {
+                    uint64_t value = 0;
+                    size_t len = lengthVal->numValue;
+                    if (startAddr + len <= liveNvram.size()) {
+                        for (size_t j = 0; j < len; j++) {
+                            value = (value << 8) | liveNvram[startAddr + j];
+                        }
+                        score = std::to_string(value);
+                    } else {
+                        score = "ERROR";
+                    }
+                } else {
+                    score = "???";
                 }
             } else {
-                score = "???";
+                // Neither offsets nor start+length found
+                allScores.push_back("");
+                continue;
             }
 
             allScores.push_back(score);
@@ -1286,29 +1329,44 @@ void extractAndLogCurrentScores() {
         if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) continue;
 
         const JsonValue* labelVal = scoreEntry->get("label");
+        const JsonValue* encodingVal = scoreEntry->get("encoding");
+        const JsonValue* offsetsVal = scoreEntry->get("offsets");
         const JsonValue* startVal = scoreEntry->get("start");
         const JsonValue* lengthVal = scoreEntry->get("length");
-        const JsonValue* encodingVal = scoreEntry->get("encoding");
 
-        if (!labelVal || !startVal || !lengthVal || !encodingVal) continue;
+        if (!labelVal || !encodingVal) continue;
 
         std::string score;
-        size_t startAddr = parseStartAddress(startVal);
-        if (encodingVal->strValue == "bcd") {
-            score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
-        } else if (encodingVal->strValue == "int") {
-            uint64_t value = 0;
-            size_t len = lengthVal->numValue;
-            if (startAddr + len <= liveNvram.size()) {
-                for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | liveNvram[startAddr + j];
-                }
-                score = std::to_string(value);
+
+        // Check if using offsets array format
+        if (offsetsVal && offsetsVal->type == JsonValue::ARRAY) {
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCDFromOffsets(liveNvram, offsetsVal);
             } else {
-                score = "ERROR";
+                score = "???";
+            }
+        }
+        // Traditional start+length format
+        else if (startVal && lengthVal) {
+            size_t startAddr = parseStartAddress(startVal);
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
+            } else if (encodingVal->strValue == "int") {
+                uint64_t value = 0;
+                size_t len = lengthVal->numValue;
+                if (startAddr + len <= liveNvram.size()) {
+                    for (size_t j = 0; j < len; j++) {
+                        value = (value << 8) | liveNvram[startAddr + j];
+                    }
+                    score = std::to_string(value);
+                } else {
+                    score = "ERROR";
+                }
+            } else {
+                score = "???";
             }
         } else {
-            score = "???";
+            continue;
         }
 
         std::string playerMarker = (i + 1 == (size_t)currentPlayer) ? " <-- PLAYING" : "";
@@ -1333,25 +1391,40 @@ void extractAndLogCurrentScores() {
         if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) continue;
 
         const JsonValue* labelVal = scoreEntry->get("label");
+        const JsonValue* encodingVal = scoreEntry->get("encoding");
+        const JsonValue* offsetsVal = scoreEntry->get("offsets");
         const JsonValue* startVal = scoreEntry->get("start");
         const JsonValue* lengthVal = scoreEntry->get("length");
-        const JsonValue* encodingVal = scoreEntry->get("encoding");
 
-        if (!labelVal || !startVal || !lengthVal || !encodingVal) continue;
+        if (!labelVal || !encodingVal) continue;
 
         std::string score;
-        size_t startAddr = parseStartAddress(startVal);
-        if (encodingVal->strValue == "bcd") {
-            score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
-        } else if (encodingVal->strValue == "int") {
-            uint64_t value = 0;
-            size_t len = lengthVal->numValue;
-            if (startAddr + len <= liveNvram.size()) {
-                for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | liveNvram[startAddr + j];
-                }
-                score = std::to_string(value);
+
+        // Check if using offsets array format
+        if (offsetsVal && offsetsVal->type == JsonValue::ARRAY) {
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCDFromOffsets(liveNvram, offsetsVal);
+            } else {
+                score = "???";
             }
+        }
+        // Traditional start+length format
+        else if (startVal && lengthVal) {
+            size_t startAddr = parseStartAddress(startVal);
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
+            } else if (encodingVal->strValue == "int") {
+                uint64_t value = 0;
+                size_t len = lengthVal->numValue;
+                if (startAddr + len <= liveNvram.size()) {
+                    for (size_t j = 0; j < len; j++) {
+                        value = (value << 8) | liveNvram[startAddr + j];
+                    }
+                    score = std::to_string(value);
+                }
+            }
+        } else {
+            continue;
         }
 
         if (i > 0) jsonOutput << ",";
@@ -1428,31 +1501,44 @@ bool extractHighScores(const std::string& mapFilePath, const std::vector<uint8_t
             initials = "???";
         }
 
-        // Extract score
+        // Extract score - support both offsets and start+length formats
+        const JsonValue* scoreOffsets = scoreVal->get("offsets");
         const JsonValue* scoreStart = scoreVal->get("start");
         const JsonValue* scoreLength = scoreVal->get("length");
         const JsonValue* scoreEncoding = scoreVal->get("encoding");
 
-        if (!scoreStart || !scoreLength || !scoreEncoding) continue;
-
         std::string score;
-        size_t scoreStartAddr = parseStartAddress(scoreStart);
-        if (scoreEncoding->strValue == "bcd") {
-            score = decodeBCD(nvram, scoreStartAddr, scoreLength->numValue);
-        } else if (scoreEncoding->strValue == "int") {
-            // Simple integer decoding (big-endian)
-            uint64_t value = 0;
-            size_t len = scoreLength->numValue;
-            if (scoreStartAddr + len <= nvram.size()) {
-                for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | nvram[scoreStartAddr + j];
-                }
-                score = std::to_string(value);
+
+        // Check if using offsets array format (e.g., gnr_300)
+        if (scoreOffsets && scoreOffsets->type == JsonValue::ARRAY && scoreEncoding) {
+            if (scoreEncoding->strValue == "bcd") {
+                score = decodeBCDFromOffsets(nvram, scoreOffsets);
             } else {
-                score = "ERROR";
+                score = "???";
+            }
+        }
+        // Traditional start+length format
+        else if (scoreStart && scoreLength && scoreEncoding) {
+            size_t scoreStartAddr = parseStartAddress(scoreStart);
+            if (scoreEncoding->strValue == "bcd") {
+                score = decodeBCD(nvram, scoreStartAddr, scoreLength->numValue);
+            } else if (scoreEncoding->strValue == "int") {
+                // Simple integer decoding (big-endian)
+                uint64_t value = 0;
+                size_t len = scoreLength->numValue;
+                if (scoreStartAddr + len <= nvram.size()) {
+                    for (size_t j = 0; j < len; j++) {
+                        value = (value << 8) | nvram[scoreStartAddr + j];
+                    }
+                    score = std::to_string(value);
+                } else {
+                    score = "ERROR";
+                }
+            } else {
+                score = "???";
             }
         } else {
-            score = "???";
+            continue;  // Skip if neither format is available
         }
 
         // Format output
@@ -1679,40 +1765,56 @@ void extractAndSaveHighScores(const char* eventName) {
             }
         }
 
-        // Extract score
+        // Extract score - support both offsets and start+length formats
+        const JsonValue* scoreOffsets = scoreVal->get("offsets");
         const JsonValue* scoreStart = scoreVal->get("start");
         const JsonValue* scoreLength = scoreVal->get("length");
         const JsonValue* scoreEncoding = scoreVal->get("encoding");
 
-        if (!scoreStart || !scoreLength || !scoreEncoding) continue;
+        if (!scoreEncoding) continue;
+        if (!scoreOffsets && (!scoreStart || !scoreLength)) continue;  // Need either offsets OR start+length
 
         std::string score;
-        size_t rawScoreAddr = parseStartAddress(scoreStart, false);
-        size_t scoreStartAddr = parseStartAddress(scoreStart);
 
-        // Debug log for first high score entry
-        static bool loggedHighScore = false;
-        if (!loggedHighScore) {
-            LOGI("High score address: raw=0x%zx, adjusted=0x%zx, length=%d, nvramSize=%zu",
-                 rawScoreAddr, scoreStartAddr, (int)scoreLength->numValue, nvramData.size());
-            loggedHighScore = true;
-        }
-
-        if (scoreEncoding->strValue == "bcd") {
-            score = decodeBCD(nvramData, scoreStartAddr, scoreLength->numValue);
-        } else if (scoreEncoding->strValue == "int") {
-            uint64_t value = 0;
-            size_t len = scoreLength->numValue;
-            if (scoreStartAddr + len <= nvramData.size()) {
-                for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | nvramData[scoreStartAddr + j];
-                }
-                score = std::to_string(value);
+        // Check if using offsets array format (e.g., gnr_300)
+        if (scoreOffsets && scoreOffsets->type == JsonValue::ARRAY) {
+            if (scoreEncoding->strValue == "bcd") {
+                score = decodeBCDFromOffsets(nvramData, scoreOffsets);
             } else {
-                score = "ERROR";
+                score = "???";
+            }
+        }
+        // Traditional start+length format
+        else if (scoreStart && scoreLength) {
+            size_t rawScoreAddr = parseStartAddress(scoreStart, false);
+            size_t scoreStartAddr = parseStartAddress(scoreStart);
+
+            // Debug log for first high score entry
+            static bool loggedHighScore = false;
+            if (!loggedHighScore) {
+                LOGI("High score address: raw=0x%zx, adjusted=0x%zx, length=%d, nvramSize=%zu",
+                     rawScoreAddr, scoreStartAddr, (int)scoreLength->numValue, nvramData.size());
+                loggedHighScore = true;
+            }
+
+            if (scoreEncoding->strValue == "bcd") {
+                score = decodeBCD(nvramData, scoreStartAddr, scoreLength->numValue);
+            } else if (scoreEncoding->strValue == "int") {
+                uint64_t value = 0;
+                size_t len = scoreLength->numValue;
+                if (scoreStartAddr + len <= nvramData.size()) {
+                    for (size_t j = 0; j < len; j++) {
+                        value = (value << 8) | nvramData[scoreStartAddr + j];
+                    }
+                    score = std::to_string(value);
+                } else {
+                    score = "ERROR";
+                }
+            } else {
+                score = "???";
             }
         } else {
-            score = "???";
+            score = "ERROR";  // Neither format available
         }
 
         // Add to JSON array
@@ -1823,27 +1925,42 @@ void checkAndBroadcastCurrentScores() {
         const JsonValue* scoreEntry = scores->at(i);
         if (!scoreEntry || scoreEntry->type != JsonValue::OBJECT) continue;
 
+        const JsonValue* encodingVal = scoreEntry->get("encoding");
+        const JsonValue* offsetsVal = scoreEntry->get("offsets");
         const JsonValue* startVal = scoreEntry->get("start");
         const JsonValue* lengthVal = scoreEntry->get("length");
-        const JsonValue* encodingVal = scoreEntry->get("encoding");
 
-        if (!startVal || !lengthVal || !encodingVal) continue;
+        if (!encodingVal) continue;
 
         std::string score;
-        size_t startAddr = parseStartAddress(startVal);
 
-        if (encodingVal->strValue == "bcd") {
-            score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
-        } else if (encodingVal->strValue == "int") {
-            uint64_t value = 0;
-            size_t len = lengthVal->numValue;
-            if (startAddr + len <= liveNvram.size()) {
-                for (size_t j = 0; j < len; j++) {
-                    value = (value << 8) | liveNvram[startAddr + j];
-                }
-                score = std::to_string(value);
+        // Check if using offsets array format
+        if (offsetsVal && offsetsVal->type == JsonValue::ARRAY) {
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCDFromOffsets(liveNvram, offsetsVal);
+            } else {
+                score = "???";
             }
         }
+        // Traditional start+length format
+        else if (startVal && lengthVal) {
+            size_t startAddr = parseStartAddress(startVal);
+            if (encodingVal->strValue == "bcd") {
+                score = decodeBCD(liveNvram, startAddr, lengthVal->numValue);
+            } else if (encodingVal->strValue == "int") {
+                uint64_t value = 0;
+                size_t len = lengthVal->numValue;
+                if (startAddr + len <= liveNvram.size()) {
+                    for (size_t j = 0; j < len; j++) {
+                        value = (value << 8) | liveNvram[startAddr + j];
+                    }
+                    score = std::to_string(value);
+                }
+            }
+        } else {
+            continue;
+        }
+
         currentScores.push_back(score);
     }
 
@@ -1899,7 +2016,7 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
         previousCurrentPlayer = 0;
         previousCurrentBall = 0;
 
-        // TEMPORARY: Also dump high scores on game start
+        // Extract high scores immediately on game start
         extractAndSaveHighScores("Game start");
     }
 }
