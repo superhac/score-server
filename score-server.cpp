@@ -87,6 +87,12 @@ SOCKET wsServerSocket = INVALID_SOCKET;
 std::vector<SOCKET> wsClients;
 std::mutex wsClientsMutex;
 
+// Message queue for initial 60 seconds
+std::vector<std::string> messageQueue;
+std::mutex messageQueueMutex;
+std::chrono::steady_clock::time_point serverStartTime;
+const std::chrono::seconds MESSAGE_QUEUE_DURATION(60);
+
 PSC_USE_ERROR();
 PSC_ERROR_IMPLEMENT(scriptApi);
 
@@ -340,7 +346,30 @@ void sendWebSocketFrame(SOCKET sock, const std::string& message) {
 void broadcastWebSocket(const std::string& message) {
     std::lock_guard<std::mutex> lock(wsClientsMutex);
 
-    // Early exit if no clients
+    // Check if we're within the message queuing window (first 60 seconds)
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - serverStartTime);
+    bool withinQueueWindow = elapsed < MESSAGE_QUEUE_DURATION;
+
+    // If past queue window and queue is not empty, clear it
+    if (!withinQueueWindow) {
+        std::lock_guard<std::mutex> queueLock(messageQueueMutex);
+        if (!messageQueue.empty()) {
+            LOGI("Message queue window expired - clearing %zu queued messages", messageQueue.size());
+            messageQueue.clear();
+        }
+    }
+
+    // If no clients connected and within queue window, queue the message
+    if (wsClients.empty() && withinQueueWindow) {
+        std::lock_guard<std::mutex> queueLock(messageQueueMutex);
+        messageQueue.push_back(message);
+        LOGI("No clients connected - queued message (%zu messages in queue, %lld seconds elapsed)",
+             messageQueue.size(), elapsed.count());
+        return;
+    }
+
+    // If no clients and past queue window, just drop the message
     if (wsClients.empty()) {
         return;
     }
@@ -838,6 +867,7 @@ void webSocketServerThread() {
                         if (sendResult > 0) {
                             // Add client to list
                             size_t clientCount = 0;
+                            size_t queuedMessageCount = 0;
                             {
                                 std::lock_guard<std::mutex> lock(wsClientsMutex);
                                 wsClients.push_back(clientSocket);
@@ -845,6 +875,24 @@ void webSocketServerThread() {
                             }
 
                             LOGI("WebSocket handshake completed, %zu clients connected", clientCount);
+
+                            // Send any queued messages to the new client
+                            {
+                                std::lock_guard<std::mutex> queueLock(messageQueueMutex);
+                                queuedMessageCount = messageQueue.size();
+                                if (!messageQueue.empty()) {
+                                    LOGI("Sending %zu queued messages to new client", queuedMessageCount);
+                                    for (const auto& queuedMessage : messageQueue) {
+                                        sendWebSocketFrame(clientSocket, queuedMessage);
+                                    }
+                                    // Don't clear the queue - let other clients within the 60s window also receive it
+                                }
+                            }
+
+                            if (queuedMessageCount > 0) {
+                                LOGI("Sent %zu queued messages to new client", queuedMessageCount);
+                            }
+
                             handshakeSuccess = true;
                         } else {
                             LOGW("Failed to send WebSocket handshake response (result: %d)", sendResult);
@@ -2269,9 +2317,10 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
 #endif
 
     // Start WebSocket server
+    serverStartTime = std::chrono::steady_clock::now();  // Mark server start time for message queue window
     wsServerRunning = true;
     wsServerThread = std::thread(webSocketServerThread);
-    LOGI("WebSocket server thread started on port 3131");
+    LOGI("WebSocket server thread started on port 3131 (message queue active for 60 seconds)");
 }
 
 MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
