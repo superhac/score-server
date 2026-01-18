@@ -1130,6 +1130,39 @@ std::string decodeBCDFromOffsets(const std::vector<uint8_t>& nvram, const JsonVa
     return result.str();
 }
 
+// Apply scale factor to a score string
+// For example, if score is "1523" and scale is 10, result is "15230"
+std::string applyScaleFactor(const std::string& score, int scale) {
+    if (scale <= 1 || score.empty() || score == "ERROR" || score == "???") {
+        return score;
+    }
+
+    // Multiply the score by the scale factor
+    // For BCD scores, this is typically done by appending zeros
+    // scale=10 means multiply by 10 (append one zero)
+    int zerosToAdd = 0;
+    int tempScale = scale;
+    while (tempScale > 1 && tempScale % 10 == 0) {
+        zerosToAdd++;
+        tempScale /= 10;
+    }
+
+    if (zerosToAdd > 0 && tempScale == 1) {
+        // Simple case: scale is a power of 10, just append zeros
+        return score + std::string(zerosToAdd, '0');
+    } else {
+        // Complex case: need to actually multiply
+        // Convert to number, multiply, convert back
+        try {
+            unsigned long long value = std::stoull(score);
+            value *= scale;
+            return std::to_string(value);
+        } catch (...) {
+            return score; // Return original if conversion fails
+        }
+    }
+}
+
 // Decode character string from NVRAM bytes with optional character map
 std::string decodeChar(const std::vector<uint8_t>& nvram, size_t start, size_t length, const std::string& charMap = "") {
     if (start + length > nvram.size()) {
@@ -1426,6 +1459,7 @@ void extractAndLogCurrentScores() {
             const JsonValue* offsetsVal = scoreEntry->get("offsets");
             const JsonValue* startVal = scoreEntry->get("start");
             const JsonValue* lengthVal = scoreEntry->get("length");
+            const JsonValue* scaleVal = scoreEntry->get("scale");
 
             std::string score;
 
@@ -1460,6 +1494,11 @@ void extractAndLogCurrentScores() {
                 // Neither offsets nor start+length found
                 allScores.push_back("");
                 continue;
+            }
+
+            // Apply scale factor if present
+            if (scaleVal && scaleVal->type == JsonValue::NUMBER && scaleVal->numValue > 1) {
+                score = applyScaleFactor(score, (int)scaleVal->numValue);
             }
 
             allScores.push_back(score);
@@ -1512,6 +1551,7 @@ void extractAndLogCurrentScores() {
         const JsonValue* offsetsVal = scoreEntry->get("offsets");
         const JsonValue* startVal = scoreEntry->get("start");
         const JsonValue* lengthVal = scoreEntry->get("length");
+        const JsonValue* scaleVal = scoreEntry->get("scale");
 
         if (!labelVal || !encodingVal) continue;
 
@@ -1548,6 +1588,11 @@ void extractAndLogCurrentScores() {
             continue;
         }
 
+        // Apply scale factor if present
+        if (scaleVal && scaleVal->type == JsonValue::NUMBER && scaleVal->numValue > 1) {
+            score = applyScaleFactor(score, (int)scaleVal->numValue);
+        }
+
         std::string playerMarker = (i + 1 == (size_t)currentPlayer) ? " <-- PLAYING" : "";
         output << labelVal->strValue << ": " << std::right << std::setw(15) << score << playerMarker << "\n";
         }
@@ -1575,6 +1620,7 @@ void extractAndLogCurrentScores() {
         const JsonValue* offsetsVal = scoreEntry->get("offsets");
         const JsonValue* startVal = scoreEntry->get("start");
         const JsonValue* lengthVal = scoreEntry->get("length");
+        const JsonValue* scaleVal = scoreEntry->get("scale");
 
         if (!labelVal || !encodingVal) continue;
 
@@ -1605,6 +1651,11 @@ void extractAndLogCurrentScores() {
             }
         } else {
             continue;
+        }
+
+        // Apply scale factor if present
+        if (scaleVal && scaleVal->type == JsonValue::NUMBER && scaleVal->numValue > 1) {
+            score = applyScaleFactor(score, (int)scaleVal->numValue);
         }
 
         if (i > 0) jsonOutput << ",";
@@ -1686,6 +1737,7 @@ bool extractHighScores(const std::string& mapFilePath, const std::vector<uint8_t
         const JsonValue* scoreStart = scoreVal->get("start");
         const JsonValue* scoreLength = scoreVal->get("length");
         const JsonValue* scoreEncoding = scoreVal->get("encoding");
+        const JsonValue* scoreScale = scoreVal->get("scale");
 
         std::string score;
 
@@ -1719,6 +1771,11 @@ bool extractHighScores(const std::string& mapFilePath, const std::vector<uint8_t
             }
         } else {
             continue;  // Skip if neither format is available
+        }
+
+        // Apply scale factor if present
+        if (scoreScale && scoreScale->type == JsonValue::NUMBER && scoreScale->numValue > 1) {
+            score = applyScaleFactor(score, (int)scoreScale->numValue);
         }
 
         // Format output
@@ -1951,6 +2008,7 @@ void extractAndSaveHighScores(const char* eventName) {
         const JsonValue* scoreStart = scoreVal->get("start");
         const JsonValue* scoreLength = scoreVal->get("length");
         const JsonValue* scoreEncoding = scoreVal->get("encoding");
+        const JsonValue* scoreScale = scoreVal->get("scale");
 
         if (!scoreEncoding) continue;
         if (!scoreOffsets && (!scoreStart || !scoreLength)) continue;  // Need either offsets OR start+length
@@ -1996,6 +2054,11 @@ void extractAndSaveHighScores(const char* eventName) {
             }
         } else {
             score = "ERROR";  // Neither format available
+        }
+
+        // Apply scale factor if present
+        if (scoreScale && scoreScale->type == JsonValue::NUMBER && scoreScale->numValue > 1) {
+            score = applyScaleFactor(score, (int)scoreScale->numValue);
         }
 
         // Add to JSON array
@@ -2110,6 +2173,7 @@ void checkAndBroadcastCurrentScores() {
         const JsonValue* offsetsVal = scoreEntry->get("offsets");
         const JsonValue* startVal = scoreEntry->get("start");
         const JsonValue* lengthVal = scoreEntry->get("length");
+        const JsonValue* scaleVal = scoreEntry->get("scale");
 
         if (!encodingVal) continue;
 
@@ -2140,6 +2204,11 @@ void checkAndBroadcastCurrentScores() {
             }
         } else {
             continue;
+        }
+
+        // Apply scale factor if present
+        if (scaleVal && scaleVal->type == JsonValue::NUMBER && scaleVal->numValue > 1) {
+            score = applyScaleFactor(score, (int)scaleVal->numValue);
         }
 
         currentScores.push_back(score);
