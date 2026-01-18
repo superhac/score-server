@@ -39,7 +39,11 @@ def print_message(data, addr):
 
     print("\n" + "="*80)
 
-    if msg_type == 'game_start':
+    if msg_type == 'table_loaded':
+        print(f"{header} - TABLE LOADED")
+        print("="*80)
+
+    elif msg_type == 'game_start':
         print(f"{header} - GAME START")
         print("="*80)
 

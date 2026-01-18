@@ -66,10 +66,22 @@ Tables can use the scriptable API to push score data directly:
 
 ### Message Types
 
-The plugin sends five types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC). If `MachineId` is configured, all messages will also include a `machine_id` field identifying which machine the message originated from.
+The plugin sends six types of WebSocket messages. All messages include a `timestamp` field in ISO 8601 format (UTC). If `MachineId` is configured, all messages will also include a `machine_id` field identifying which machine the message originated from.
+
+#### Table Loaded
+Sent when a ROM-less table is loaded and initialized (ROM-less tables only).
+```json
+{
+  "type": "table_loaded",
+  "timestamp": "2026-01-15T12:30:00.123Z",
+  "rom": "MyAwesomeTable",
+  "machine_id": "Cabinet1"
+}
+```
+*Note: This is sent when SetGameName() is called, typically in Table_Init. It indicates the table has loaded but the player hasn't started a game yet.*
 
 #### Game Start
-Sent when a new game begins.
+Sent when a new game begins (player starts playing).
 ```json
 {
   "type": "game_start",
@@ -145,10 +157,15 @@ For tables that don't use PinMAME ROMs, you can use the scriptable API to broadc
 
 Quick example:
 ```vbscript
+Const GAME_STATE_START = 1
+Const GAME_STATE_PLAYING = 2
+Const GAME_STATE_END = 3
+
 Sub Table_Init()
     Dim Server
     Set Server = CreateObject("VPinball.ScoreServer")
     Server.SetGameName "MyTable_v1.0"
+    Server.SetGameState 1, 1, 1, GAME_STATE_START  ' playerCount, currentPlayer, currentBall, gameState
 End Sub
 
 Sub AddScore(points)
@@ -157,6 +174,7 @@ Sub AddScore(points)
     Dim Server
     Set Server = CreateObject("VPinball.ScoreServer")
     Server.SetScoresArray Join(playerNames, "|"), Join(scores, "|")
+    Server.SetGameState PlayersPlayingGame, CurrentPlayer, CurrentBall, GAME_STATE_PLAYING
 End Sub
 ```
 
@@ -337,6 +355,10 @@ ws.onmessage = (event) => {
   // Optional: Check which machine sent this message
   const machine = data.machine_id ? `[${data.machine_id}] ` : '';
 
+  if (data.type === 'table_loaded') {
+    console.log(`${machine}[${data.timestamp}] Table loaded: ${data.rom}`);
+  }
+
   if (data.type === 'game_start') {
     console.log(`${machine}[${data.timestamp}] Game started: ${data.rom}`);
   }
@@ -377,7 +399,10 @@ def on_message(ws, message):
     # Optional: Check which machine sent this message
     machine = f"[{data['machine_id']}] " if 'machine_id' in data else ''
 
-    if data['type'] == 'game_start':
+    if data['type'] == 'table_loaded':
+        print(f"{machine}[{data['timestamp']}] Table loaded: {data['rom']}")
+
+    elif data['type'] == 'game_start':
         print(f"{machine}[{data['timestamp']}] Game started: {data['rom']}")
 
     elif data['type'] == 'game_end':

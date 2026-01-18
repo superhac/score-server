@@ -88,9 +88,16 @@ End Sub
 ### 3. Update Game State
 
 ```vbscript
-Sub UpdateGameState()
+' Game state constants
+Const GAME_STATE_START = 1
+Const GAME_STATE_PLAYING = 2
+Const GAME_STATE_END = 3
+
+Sub UpdateGameState(state)
     If Not ScoreServer Is Nothing Then
-        ScoreServer.SetGameState PlayersPlayingGame, CurrentPlayer, BallsPerGame
+        ' Parameters: playerCount, currentPlayer, currentBall, gameState
+        ' gameState: 1 = Game Start, 2 = Game Playing, 3 = Game End
+        ScoreServer.SetGameState PlayersPlayingGame, CurrentPlayer, CurrentBall, state
     End If
 End Sub
 ```
@@ -153,6 +160,11 @@ Dim CurrentPlayer
 Dim CurrentBall
 Dim BallsPerGame
 
+' Game state constants
+Const GAME_STATE_START = 1
+Const GAME_STATE_PLAYING = 2
+Const GAME_STATE_END = 3
+
 '*************************************
 ' Table Initialization
 '*************************************
@@ -176,7 +188,7 @@ Sub Table_Init()
         Score(i) = 0
     Next
 
-    UpdateGameState
+    UpdateGameState GAME_STATE_START
 End Sub
 
 '*************************************
@@ -202,9 +214,11 @@ End Sub
 '*************************************
 ' Game State Updates
 '*************************************
-Sub UpdateGameState()
+Sub UpdateGameState(state)
     If Not ScoreServer Is Nothing Then
-        ScoreServer.SetGameState PlayersPlayingGame, CurrentPlayer, CurrentBall
+        ' Parameters: playerCount, currentPlayer, currentBall, gameState
+        ' gameState: 1 = Game Start, 2 = Game Playing, 3 = Game End
+        ScoreServer.SetGameState PlayersPlayingGame, CurrentPlayer, CurrentBall, state
     End If
 End Sub
 
@@ -218,7 +232,7 @@ Sub NextBall()
             Exit Sub
         End If
     End If
-    UpdateGameState
+    UpdateGameState GAME_STATE_PLAYING
 End Sub
 
 '*************************************
@@ -262,6 +276,9 @@ Sub EndOfGame()
         If highestScore > 0 Then
             ScoreServer.SetHighScoresArray "Last Game Winner", "P" & winner, CStr(highestScore)
         End If
+
+        ' Send game end event
+        UpdateGameState GAME_STATE_END
 
         ' Clear state
         ScoreServer.ClearState
@@ -318,7 +335,7 @@ Each badge is sent as an individual event when awarded:
 | Method | Parameters | Description |
 |--------|------------|-------------|
 | `SetGameName` | `string gameName` | Set the game name (must be called first) |
-| `SetGameState` | `int playerCount, int currentPlayer, int currentBall` | Update game state |
+| `SetGameState` | `int playerCount, int currentPlayer, int currentBall, int gameState` | Update game state and send lifecycle events. gameState: 1=Game Start, 2=Game Playing, 3=Game End |
 | `SetScoresArray` | `string playersDelimited, string scoresDelimited` | Set all player names and scores using pipe-delimited strings |
 | `SetHighScoresArray` | `string labelsDelimited, string initialsDelimited, string scoresDelimited` | Set all high scores at once using pipe-delimited strings |
 | `AwardBadge` | `string player, string name, string description` | Award an achievement to a specific player (sends badge event immediately) |

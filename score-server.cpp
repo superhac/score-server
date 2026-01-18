@@ -2241,24 +2241,54 @@ public:
         tableGameName = gameName;
         LOGI("Table game name set to: %s", gameName.c_str());
 
-        // Send game_start message
-        std::stringstream gameStartMsg;
-        gameStartMsg << "{\"type\":\"game_start\","
-                     << "\"timestamp\":\"" << getTimestamp() << "\","
-                     << "\"rom\":\"" << tableGameName << "\""
-                     << addMachineIdField() << "}";
-        broadcastWebSocket(gameStartMsg.str());
+        // Send table_loaded message
+        std::stringstream tableLoadedMsg;
+        tableLoadedMsg << "{\"type\":\"table_loaded\","
+                       << "\"timestamp\":\"" << getTimestamp() << "\","
+                       << "\"rom\":\"" << tableGameName << "\""
+                       << addMachineIdField() << "}";
+        broadcastWebSocket(tableLoadedMsg.str());
     }
 
     // Set game state
-    void SetGameState(int playerCount, int currentPlayer, int currentBall) {
+    // gameState: 1 = Game Start, 2 = Game Playing, 3 = Game End
+    void SetGameState(int playerCount, int currentPlayer, int currentBall, int gameState) {
         {
             std::lock_guard<std::mutex> lock(tableStateMutex);
             tablePlayerCount = playerCount;
             tableCurrentPlayer = currentPlayer;
             tableCurrentBall = currentBall;
         }
-        broadcastTableScores();
+
+        // Handle game state changes - send lifecycle events separately
+        if (gameState == 1) {
+            // Game Start - send dedicated game_start event
+            std::stringstream gameStartMsg;
+            gameStartMsg << "{\"type\":\"game_start\","
+                         << "\"timestamp\":\"" << getTimestamp() << "\","
+                         << "\"rom\":\"" << tableGameName << "\""
+                         << addMachineIdField() << "}";
+            broadcastWebSocket(gameStartMsg.str());
+            LOGI("Game start event sent for: %s", tableGameName.c_str());
+
+            // Also broadcast current scores after game start
+            broadcastTableScores();
+        } else if (gameState == 3) {
+            // Game End - send dedicated game_end event
+            std::stringstream gameEndMsg;
+            gameEndMsg << "{\"type\":\"game_end\","
+                       << "\"timestamp\":\"" << getTimestamp() << "\","
+                       << "\"rom\":\"" << tableGameName << "\""
+                       << addMachineIdField() << "}";
+            broadcastWebSocket(gameEndMsg.str());
+            LOGI("Game end event sent for: %s", tableGameName.c_str());
+
+            // Also broadcast final scores after game end
+            broadcastTableScores();
+        } else if (gameState == 2) {
+            // Game Playing - only broadcast current scores
+            broadcastTableScores();
+        }
     }
 
     // Helper to split string by delimiter
@@ -2370,7 +2400,7 @@ static ScoreServerClass scoreServerInstance;
 // Register the scriptable class
 PSC_CLASS_START(ScoreServerClass)
     PSC_FUNCTION1(ScoreServerClass, void, SetGameName, string)
-    PSC_FUNCTION3(ScoreServerClass, void, SetGameState, int, int, int)
+    PSC_FUNCTION4(ScoreServerClass, void, SetGameState, int, int, int, int)
     PSC_FUNCTION2(ScoreServerClass, void, SetScoresArray, string, string)
     PSC_FUNCTION3(ScoreServerClass, void, SetHighScoresArray, string, string, string)
     PSC_FUNCTION3(ScoreServerClass, void, AwardBadge, string, string, string)

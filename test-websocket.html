@@ -68,6 +68,9 @@
             border-left: 3px solid #0e639c;
             background: #1e1e1e;
         }
+        .message.table-loaded {
+            border-left-color: #9cdcfe;
+        }
         .message.high-scores {
             border-left-color: #4ec9b0;
         }
@@ -156,7 +159,7 @@
         let reconnectTimer = null;
         let connectionTimeout = null;
         let manualDisconnect = false;
-        const RECONNECT_DELAY = 500; // Hammer it every 500ms
+        const RECONNECT_DELAY = 500; // Reconnect every 500ms - server is now robust!
         const statusDiv = document.getElementById('status');
         const messagesDiv = document.getElementById('messages');
         const rawJsonDiv = document.getElementById('rawJson');
@@ -196,7 +199,9 @@
                 content += `<div class="timestamp">Server Time: ${data.timestamp}</div>`;
             }
 
-            if (type === 'game-start') {
+            if (type === 'table-loaded') {
+                content += `<div class="message-data">Table loaded</div>`;
+            } else if (type === 'game-start') {
                 content += `<div class="message-data">Game started</div>`;
             } else if (type === 'game-end') {
                 content += `<div class="message-data">Game ended</div>`;
@@ -255,8 +260,16 @@
             }
 
             // Don't try to connect if already connected or connecting
-            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
-                return;
+            if (ws) {
+                if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+                    console.log('Already connected or connecting, skipping');
+                    return;
+                }
+                // Close any existing connection in CLOSING or CLOSED state
+                if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+                    console.log('Cleaning up old WebSocket connection');
+                    ws = null;
+                }
             }
 
             try {
@@ -267,11 +280,15 @@
                 connectionTimeout = setTimeout(() => {
                     if (ws && ws.readyState === WebSocket.CONNECTING) {
                         console.log('Connection timeout - closing stale connection');
-                        ws.close();
+                        // Remove event handlers before closing to prevent double-reconnect
+                        const oldWs = ws;
                         ws = null;
+                        oldWs.onclose = null;
+                        oldWs.onerror = null;
+                        oldWs.close();
                         updateStatus(false);
 
-                        // Auto-reconnect immediately
+                        // Auto-reconnect
                         if (!manualDisconnect) {
                             console.log(`Will retry connection in ${RECONNECT_DELAY}ms...`);
                             reconnectTimer = setTimeout(connect, RECONNECT_DELAY);
@@ -297,7 +314,9 @@
                     // Parse and display formatted message
                     try {
                         const data = JSON.parse(event.data);
-                        if (data.type === 'game_start') {
+                        if (data.type === 'table_loaded') {
+                            addMessage('table-loaded', data);
+                        } else if (data.type === 'game_start') {
                             addMessage('game-start', data);
                         } else if (data.type === 'game_end') {
                             addMessage('game-end', data);
