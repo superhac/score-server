@@ -51,6 +51,94 @@
    #define closesocket close
 #endif
 
+///////////////////////////////////////////////////////////////////////////////
+// Minimal portable UDP sockets
+// Derived from https://github.com/simondlevy/CppSockets (MIT licensed)
+
+#ifndef _WIN32
+   #define sprintf_s snprintf
+#endif
+
+class UdpClientSocket
+{
+protected:
+   SOCKET _sock;
+   struct sockaddr_in _si_other {};
+   socklen_t _slen = sizeof(_si_other);
+   char _message[200];
+
+   bool initWinsock()
+   {
+      #ifdef _WIN32
+         WSADATA wsaData;
+         int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+         if (iResult != 0)
+         {
+            sprintf_s(_message, sizeof(_message), "WSAStartup() failed with error: %d\n", iResult);
+            return false;
+         }
+      #endif
+      return true;
+   }
+
+   void inetPton(const char* host, struct sockaddr_in& saddr_in)
+   {
+      #ifdef _WIN32
+         #ifdef _UNICODE
+            InetPtonA(AF_INET, host, &(saddr_in.sin_addr.s_addr));
+         #else
+            InetPton(AF_INET, host, &(saddr_in.sin_addr.s_addr));
+         #endif
+      #else
+         inet_pton(AF_INET, host, &(saddr_in.sin_addr));
+      #endif
+   }
+
+public:
+   UdpClientSocket(const char* host, const short port)
+   {
+      _sock = INVALID_SOCKET;
+      _message[0] = '\0';
+
+      // Initialize Winsock, returning on failure
+      if (!initWinsock())
+         return;
+
+      // Create socket
+      _sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      if (_sock == SOCKET_ERROR)
+      {
+         sprintf_s(_message, sizeof(_message), "socket() failed");
+         _sock = INVALID_SOCKET;
+         return;
+      }
+
+      // Setup address structure
+      memset((char*)&_si_other, 0, sizeof(_si_other));
+      _si_other.sin_family = AF_INET;
+      _si_other.sin_port = htons(port);
+      inetPton(host, _si_other);
+   }
+
+   ~UdpClientSocket()
+   {
+      if (_sock != INVALID_SOCKET)
+      {
+         closesocket(_sock);
+      }
+   }
+
+   int sendData(const void* buf, size_t len)
+   {
+      if (_sock == INVALID_SOCKET)
+         return -1;
+      return sendto(_sock, (const char*)buf, (int)len, 0, (struct sockaddr*)&_si_other, (int)_slen);
+   }
+
+   bool isValid() const { return _sock != INVALID_SOCKET; }
+   const char* getMessage() const { return _message; }
+};
+
 namespace ScoreServer {
 
 const MsgPluginAPI* msgApi = nullptr;
@@ -62,6 +150,15 @@ unsigned int getVpxApiId, getScriptApiId, getControllerId, onGameEndId, onGameSt
 
 // Plugin settings
 MSGPI_STRING_VAL_SETTING(machineIdProp, "MachineId", "Machine ID", "Unique identifier for this machine", false, "", 256);
+
+// Broadcast mode configuration
+const char* broadcastModeLiterals[] = { "WebSocket", "UDP", "Both" };
+MSGPI_ENUM_VAL_SETTING(broadcastModeProp, "BroadcastMode", "Broadcast Mode", "Select broadcast method: WebSocket server, UDP endpoint, or Both", false, 1, 3, broadcastModeLiterals, 1);
+MSGPI_STRING_VAL_SETTING(udpHostProp, "UdpHost", "UDP Host", "UDP endpoint hostname or IP address (e.g., 192.168.1.100)", false, "", 256);
+MSGPI_INT_VAL_SETTING(udpPortProp, "UdpPort", "UDP Port", "UDP endpoint port number (e.g., 9000)", false, 0, 65535, 0);
+
+// UDP client for endpoint broadcasting
+UdpClientSocket* udpClient = nullptr;
 
 std::string currentRomName;
 std::string nvramMapsPath;
@@ -359,6 +456,25 @@ void sendWebSocketFrame(SOCKET sock, const std::string& message) {
 
 // Broadcast to all WebSocket clients
 void broadcastWebSocket(const std::string& message) {
+    // Send via UDP if UDP mode is enabled
+    int broadcastMode = broadcastModeProp_Val;  // 1=WebSocket, 2=UDP, 3=Both
+    if ((broadcastMode == 2 || broadcastMode == 3) && udpClient && udpClient->isValid()) {
+        int sent = udpClient->sendData(message.c_str(), message.length());
+        if (sent < 0) {
+            LOGW("Failed to send UDP message");
+        } else {
+            LOGI("UDP message sent: %d bytes", sent);
+        }
+    } else if (broadcastMode == 2 || broadcastMode == 3) {
+        LOGW("UDP mode enabled but udpClient is not valid (client=%p, valid=%d)",
+             udpClient, udpClient ? udpClient->isValid() : 0);
+    }
+
+    // If UDP-only mode, skip WebSocket broadcasting
+    if (broadcastMode == 2) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(wsClientsMutex);
 
     // Check if we're within the message queuing window (first 60 seconds)
@@ -2293,6 +2409,34 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
 
     // Register plugin settings
     msgApi->RegisterSetting(endpointId, &machineIdProp);
+    msgApi->RegisterSetting(endpointId, &broadcastModeProp);
+    msgApi->RegisterSetting(endpointId, &udpHostProp);
+    msgApi->RegisterSetting(endpointId, &udpPortProp);
+
+    // Initialize UDP client if UDP mode is enabled
+    int broadcastMode = broadcastModeProp_Val;  // 1=WebSocket, 2=UDP, 3=Both
+    const char* modeName = (broadcastMode == 1) ? "WebSocket" : (broadcastMode == 2) ? "UDP" : (broadcastMode == 3) ? "Both" : "Unknown";
+    LOGI("Broadcast Mode: %s (%d)", modeName, broadcastMode);
+
+    if (broadcastMode == 2 || broadcastMode == 3) {
+        const char* udpHost = udpHostProp_Get();
+        int udpPort = udpPortProp_Val;
+
+        LOGI("UDP configuration: Host=%s, Port=%d", udpHost ? udpHost : "(null)", udpPort);
+
+        if (udpHost && udpHost[0] != '\0' && udpPort > 0) {
+            udpClient = new UdpClientSocket(udpHost, (short)udpPort);
+            if (udpClient->isValid()) {
+                LOGI("UDP client initialized successfully for endpoint %s:%d", udpHost, udpPort);
+            } else {
+                LOGE("Failed to initialize UDP client: %s", udpClient->getMessage());
+                delete udpClient;
+                udpClient = nullptr;
+            }
+        } else {
+            LOGW("UDP mode enabled but UdpHost or UdpPort not configured properly");
+        }
+    }
 
     // Get VPX API
     msgApi->BroadcastMsg(endpointId, getVpxApiId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_API), &vpxApi);
@@ -2339,11 +2483,15 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
     }
 #endif
 
-    // Start WebSocket server
-    serverStartTime = std::chrono::steady_clock::now();  // Mark server start time for message queue window
-    wsServerRunning = true;
-    wsServerThread = std::thread(webSocketServerThread);
-    LOGI("WebSocket server thread started on port 3131 (message queue active for 60 seconds)");
+    // Start WebSocket server (unless in UDP-only mode)
+    if (broadcastMode != 2) {  // Skip WebSocket server in UDP-only mode
+        serverStartTime = std::chrono::steady_clock::now();  // Mark server start time for message queue window
+        wsServerRunning = true;
+        wsServerThread = std::thread(webSocketServerThread);
+        LOGI("WebSocket server thread started on port 3131 (message queue active for 60 seconds)");
+    } else {
+        LOGI("Running in UDP-only mode - WebSocket server not started");
+    }
 }
 
 MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
@@ -2389,6 +2537,13 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
         wsServerThread.join();
     }
     LOGI("WebSocket server thread stopped");
+
+    // Cleanup UDP client
+    if (udpClient) {
+        delete udpClient;
+        udpClient = nullptr;
+        LOGI("UDP client closed");
+    }
 
 #ifdef _WIN32
     WSACleanup();

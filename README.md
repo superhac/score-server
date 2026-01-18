@@ -1,20 +1,23 @@
 # Score Server Plugin
 
-This plugin provides a WebSocket server that broadcasts high scores and live game scores in real-time for both PinMAME games and ROM-less tables.
+This plugin broadcasts high scores and live game scores in real-time for both PinMAME games and ROM-less tables via WebSocket server or UDP endpoint.
 
 <img width="1215" height="1063" alt="image" src="https://github.com/user-attachments/assets/ba2f07bf-4850-4fed-9032-f82dca1a634b" />
 
 Prototype videos in action: [rom based](https://www.youtube.com/shorts/ERsjBmrbnQw), [non-rom + awards](https://www.youtube.com/shorts/ERsjBmrbnQw)
 ## Features
 
+- **Flexible broadcasting** - supports WebSocket server, UDP endpoint, or both simultaneously
 - **WebSocket server on port 3131** - broadcasts scores to connected clients in real-time
+- **UDP endpoint support** - send JSON messages directly to a UDP receiver (low latency, fire-and-forget)
+- **Machine ID tagging** - optionally tag all messages with a unique machine identifier
 - **Game lifecycle tracking** - sends game_start and game_end messages with timestamps
 - **Real-time current scores** - sends player scores, current player, and ball number as they change during gameplay
 - **High scores broadcast** - sends structured high scores with player initials when games start/end
 - **Badge/achievement system** - award and broadcast achievements in real-time
 - **Timestamps on all messages** - ISO 8601 format (UTC) for precise event tracking
 - **Change detection** - only broadcasts when game state actually changes (not time-based polling)
-- **Automatic reconnection** - clients automatically reconnect if connection is lost
+- **Automatic reconnection** - WebSocket clients automatically reconnect if connection is lost
 - **Structured JSON output** - all messages sent as structured JSON
 - **ROM-less table support** - scriptable API for tables without PinMAME ROMs
 - **PinMAME integration** - automatically detects ROM being played and uses [pinmame-nvram-maps](https://github.com/tomlogic/pinmame-nvram-maps) to decode NVRAM data
@@ -219,16 +222,87 @@ Configure the plugin in your `VPinballX.ini` file:
 [Plugin.ScoreServer]
 Enable = 1
 MachineId = MyPinballCabinet
+BroadcastMode = WebSocket
+UdpHost = 192.168.1.100
+UdpPort = 9000
 ```
 
 ### Configuration Options
 
 - **Enable** (required): Set to `1` to enable the plugin
 - **MachineId** (optional): A unique identifier for this machine. When set, all WebSocket messages will include a `machine_id` field to identify which cabinet the message originated from. This is useful when broadcasting scores from multiple machines to the same client.
+- **BroadcastMode** (optional): Select how to broadcast messages. Options:
+  - `WebSocket` (default): Run WebSocket server on port 3131 for clients to connect
+  - `UDP`: Send messages to a UDP endpoint (no WebSocket server)
+  - `Both`: Run WebSocket server AND send to UDP endpoint
+- **UdpHost** (required if BroadcastMode is UDP or Both): Hostname or IP address of the UDP endpoint (e.g., `192.168.1.100` or `myserver.com`)
+- **UdpPort** (required if BroadcastMode is UDP or Both): Port number of the UDP endpoint (e.g., `9000`)
 
 ## Network Configuration
 
-The WebSocket server listens on **port 3131** on all network interfaces.
+### WebSocket Mode
+
+The WebSocket server listens on **port 3131** on all network interfaces. This is the default mode.
+
+**Pros:**
+- Multiple clients can connect simultaneously
+- Clients automatically receive all messages in real-time
+- Includes automatic reconnection logic
+- Message queue for first 60 seconds ensures no data loss during startup
+
+**Cons:**
+- Requires clients to maintain persistent connections
+- More complex client implementation
+
+### UDP Mode
+
+In UDP mode, the plugin sends JSON messages directly to a configured endpoint via UDP packets.
+
+**Pros:**
+- Fire-and-forget messaging (no connection management)
+- Very low latency
+- Simple receiver implementation (just listen on a UDP port)
+- No WebSocket overhead
+
+**Cons:**
+- No delivery guarantee (messages may be lost in network congestion)
+- No message queuing
+- Single endpoint only
+
+**Example UDP receiver (Python):**
+```python
+import socket
+import json
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(('0.0.0.0', 9000))
+
+print("Listening for UDP messages on port 9000...")
+while True:
+    data, addr = sock.recvfrom(65535)
+    message = json.loads(data.decode('utf-8'))
+    print(f"Received from {addr}: {message['type']}")
+```
+
+**Example UDP receiver (Node.js):**
+```javascript
+const dgram = require('dgram');
+const server = dgram.createSocket('udp4');
+
+server.on('message', (msg, rinfo) => {
+  const data = JSON.parse(msg.toString());
+  console.log(`Received ${data.type} from ${rinfo.address}:${rinfo.port}`);
+});
+
+server.bind(9000);
+console.log('Listening for UDP messages on port 9000...');
+```
+
+### Both Mode
+
+When set to `Both`, the plugin runs both the WebSocket server and sends to the UDP endpoint simultaneously. This is useful when you want:
+- Local WebSocket clients for testing/debugging
+- Remote UDP endpoint for production score aggregation
 
 ### Firewall Configuration
 
