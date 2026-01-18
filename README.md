@@ -222,6 +222,7 @@ Configure the plugin in your `VPinballX.ini` file:
 [Plugin.ScoreServer]
 Enable = 1
 MachineId = MyPinballCabinet
+; WebSocket or UDP or Both
 BroadcastMode = WebSocket
 UdpHost = 192.168.1.100
 UdpPort = 9000
