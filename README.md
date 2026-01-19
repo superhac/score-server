@@ -29,12 +29,26 @@ Prototype videos in action: [rom based](https://www.youtube.com/shorts/ERsjBmrbn
 
 ## How It Works
 
-### WebSocket Server
+### Broadcasting Modes
 
-The plugin starts a WebSocket server on port **3131** that listens on all network interfaces (0.0.0.0). This allows:
-- Local connections from `ws://localhost:3131`
-- Network connections from `ws://<your-ip>:3131`
+The plugin supports three broadcasting modes (configured via `BroadcastMode` in VPinballX.ini):
+
+**WebSocket Mode (default):**
+- Starts a WebSocket server on port **3131** listening on all network interfaces (0.0.0.0)
+- Allows local connections from `ws://localhost:3131`
+- Allows network connections from `ws://<your-ip>:3131`
 - Multiple clients can connect simultaneously
+- Includes message queuing and automatic reconnection support
+
+**UDP Mode:**
+- Sends JSON messages directly to a configured UDP endpoint
+- Fire-and-forget delivery (no connection management)
+- Very low latency
+- Single endpoint only
+
+**Both Mode:**
+- Runs WebSocket server AND sends to UDP endpoint simultaneously
+- Useful for local testing (WebSocket) plus remote aggregation (UDP)
 
 ### Game Flow
 
@@ -240,8 +254,8 @@ Configure the plugin in your `VPinballX.ini` file:
 [Plugin.ScoreServer]
 Enable = 1
 MachineId = MyPinballCabinet
-; WebSocket or UDP or Both
-BroadcastMode = WebSocket
+; 1=WebSocket or 2=UDP or 3=Both
+BroadcastMode = 1
 UdpHost = 192.168.1.100
 UdpPort = 9000
 ```
