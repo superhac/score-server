@@ -25,7 +25,7 @@ Prototype videos in action: [rom based](https://www.youtube.com/shorts/ERsjBmrbn
 
 ## Requirements
 
-**None!** The plugin comes with all necessary NVRAM map files bundled. Just build and use!
+You must apply this [patch](https://github.com/vpinball/vpinball/commit/c1ca14346fc30c1ff883a28cf15ec0197a818a94) to the Pinmame plugin for this to work. 
 
 ## How It Works
 
