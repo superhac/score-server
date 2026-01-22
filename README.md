@@ -238,6 +238,11 @@ Copy CMakeLists_plugin_ScoreServer.txt (when your inside the score-server dir)
 cp CMakeLists_plugin_ScoreServer.txt ../../make/
 ```
 
+Then add this line to make/CMakeLists_plugins.txt:
+```
+include("${CMAKE_SOURCE_DIR}/make/CMakeLists_plugin_ScoreServer.txt")
+```
+
 The plugin is built automatically when you build VPinball with CMake:
 
 ```bash
