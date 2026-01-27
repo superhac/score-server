@@ -178,6 +178,9 @@ std::vector<std::string> previousScores;
 int previousPlayerCount = 0;
 int previousCurrentPlayer = 0;
 int previousCurrentBall = 0;
+bool previousGameOver = false;
+bool gameEndSent = false;
+bool firstStateCheck = true;
 
 
 // WebSocket server
@@ -2214,11 +2217,63 @@ void checkAndBroadcastCurrentScores() {
         currentScores.push_back(score);
     }
 
+   // Check for game over condition
+   bool currentGameOver = false;
+   const JsonValue* gameOverObj = gameState->get("game_over");
+   if (gameOverObj)
+   {
+      currentGameOver = (decodeValue(liveNvram, gameOverObj) != 0);
+   }
+
+   // Skip detection on first check to establish baseline
+   if (firstStateCheck)
+   {
+      previousGameOver = currentGameOver;
+      firstStateCheck = false;
+   }
+   // Detect game over transition (false -> true)
+   else if (currentGameOver && !previousGameOver && !gameEndSent)
+   {
+      std::stringstream scoreLog;
+      scoreLog << "Game over detected via NVRAM. Final Scores: | ";
+      for (size_t i = 0; i < currentScores.size(); ++i)
+      {
+         scoreLog << "P" << (i + 1) << ": " << currentScores[i] << " | ";
+      }
+      LOGI("%s", scoreLog.str().c_str());
+
+      gameEndSent = true;
+
+      // Broadcast game end message via WebSocket
+      std::stringstream gameEndMsg;
+      gameEndMsg << "{\"type\":\"game_end\","
+                 << "\"timestamp\":\"" << getTimestamp() << "\","
+                 << "\"rom\":\"" << currentRomName << "\""
+                 << addMachineIdField() << "}";
+      broadcastWebSocket(gameEndMsg.str());
+
+      // Extract final high scores
+      extractAndSaveHighScores("Game end (NVRAM detected)");
+   }
+   // Detect new game started via flag reset (true -> false)
+   else if (!currentGameOver && previousGameOver)
+   {
+      if (currentBall > 0)
+      {
+         LOGI("Game over flag cleared and Ball > 0 (New Game detected) - Re-arming trigger");
+         gameEndSent = false;
+      }
+      else
+      {
+         LOGI("Game over flag cleared but Ball is 0 (Attract Mode flickering) - Keeping trigger inactive");
+      }
+   }
     // Check if anything changed
-    bool changed = (playerCount != previousPlayerCount ||
-                    currentPlayer != previousCurrentPlayer ||
-                    currentBall != previousCurrentBall ||
-                    currentScores != previousScores);
+   bool changed = (playerCount != previousPlayerCount ||
+                   currentPlayer != previousCurrentPlayer ||
+                   currentBall != previousCurrentBall ||
+                   currentScores != previousScores ||
+                   currentGameOver != previousGameOver);
 
     if (changed) {
         // Update previous state
@@ -2226,6 +2281,7 @@ void checkAndBroadcastCurrentScores() {
         previousCurrentPlayer = currentPlayer;
         previousCurrentBall = currentBall;
         previousScores = currentScores;
+      previousGameOver = currentGameOver;
 
         // Log and broadcast the change
         extractAndLogCurrentScores();
@@ -2266,6 +2322,9 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
         previousPlayerCount = 0;
         previousCurrentPlayer = 0;
         previousCurrentBall = 0;
+      previousGameOver = false;
+      gameEndSent = false;
+      firstStateCheck = true;
 
         // Extract high scores immediately on game start
         extractAndSaveHighScores("Game start");
