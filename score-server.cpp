@@ -1362,7 +1362,7 @@ bool getNVRAMFromController(std::vector<uint8_t>& nvram) {
         // Log first 32 bytes to understand the layout
         std::stringstream hexDump;
         hexDump << "First 32 bytes: ";
-        for (size_t i = 0; i < std::min(arraySize, (size_t)32); i++) {
+        for (size_t i = 0; i < (std::min)(arraySize, (size_t)32); i++) {
             char buf[8];
             snprintf(buf, sizeof(buf), "%02X ", dataPtr[i]);
             hexDump << buf;
@@ -2137,7 +2137,7 @@ void checkAndBroadcastCurrentScores() {
     if (!loggedLayout && playerCount == 0 && liveNvram.size() > 0) {
         std::stringstream hexDump;
         hexDump << "NVRAM at addresses 0x00-0x20: ";
-        for (size_t i = 0; i < std::min(liveNvram.size(), (size_t)32); i++) {
+        for (size_t i = 0; i < (std::min)(liveNvram.size(), (size_t)32); i++) {
             char buf[8];
             snprintf(buf, sizeof(buf), "%02X ", liveNvram[i]);
             hexDump << buf;
