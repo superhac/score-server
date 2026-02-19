@@ -86,6 +86,9 @@
         .message.badge {
             border-left-color: #d7ba7d;
         }
+        .message.connected {
+            border-left-color: #4ec9b0;
+        }
         .message-type {
             font-weight: bold;
             color: #569cd6;
@@ -199,7 +202,13 @@
                 content += `<div class="timestamp">Server Time: ${data.timestamp}</div>`;
             }
 
-            if (type === 'table-loaded') {
+            if (type === 'connected') {
+                content += `<div class="message-data">Server: ${data.server} v${data.version}\nBroadcast Mode: ${data.broadcastMode}\nGame Active: ${data.gameActive}`;
+                if (data.gameActive && data.rom) {
+                    content += `\nROM: ${data.rom}`;
+                }
+                content += `</div>`;
+            } else if (type === 'table-loaded') {
                 content += `<div class="message-data">Table loaded</div>`;
             } else if (type === 'game-start') {
                 content += `<div class="message-data">Game started</div>`;
@@ -314,7 +323,9 @@
                     // Parse and display formatted message
                     try {
                         const data = JSON.parse(event.data);
-                        if (data.type === 'table_loaded') {
+                        if (data.type === 'connected') {
+                            addMessage('connected', data);
+                        } else if (data.type === 'table_loaded') {
                             addMessage('table-loaded', data);
                         } else if (data.type === 'game_start') {
                             addMessage('game-start', data);

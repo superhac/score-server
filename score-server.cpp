@@ -69,15 +69,7 @@ protected:
 
    bool initWinsock()
    {
-      #ifdef _WIN32
-         WSADATA wsaData;
-         int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-         if (iResult != 0)
-         {
-            sprintf_s(_message, sizeof(_message), "WSAStartup() failed with error: %d\n", iResult);
-            return false;
-         }
-      #endif
+      // Winsock initialization is handled by PluginLoad/PluginUnload
       return true;
    }
 
@@ -181,6 +173,20 @@ int previousCurrentBall = 0;
 bool previousGameOver = false;
 bool gameEndSent = false;
 bool firstStateCheck = true;
+
+// Game start timestamp for minimum duration check
+std::chrono::steady_clock::time_point gameStartTime;
+// Sometimes the game_start and game_end events are fired during the
+// initialization of the table/plugin. To avoid false positives, we will 
+// ignore any game that ends within 60 seconds of starting, as it's unlikely to be a valid play session.  
+// Minimum 60 seconds for a valid game
+// Not sure if this could be related to the plugins being still on hard development. 
+const std::chrono::seconds MIN_GAME_DURATION(60); 
+
+// Ball-drop fallback game-over detection
+// Stores the scores from the last game_end we sent, so we don't re-trigger
+// for the same scores lingering in attract mode after a game ends
+std::vector<std::string> lastGameEndScores;
 
 
 // WebSocket server
@@ -840,20 +846,11 @@ JsonValue* SimpleJsonParser::parseValue() {
 void webSocketServerThread() {
     LOGI("WebSocket server thread starting...");
 
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        LOGE("WSAStartup failed");
-        return;
-    }
-#endif
+    // Winsock initialization is handled by PluginLoad/PluginUnload
 
     wsServerSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (wsServerSocket == INVALID_SOCKET) {
         LOGE("Failed to create WebSocket server socket");
-#ifdef _WIN32
-        WSACleanup();
-#endif
         return;
     }
 
@@ -879,20 +876,24 @@ void webSocketServerThread() {
     serverAddr.sin_port = htons(3131);
 
     if (bind(wsServerSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) {
-        LOGE("Failed to bind WebSocket server to port 3131 (errno: %d)", errno);
-        closesocket(wsServerSocket);
 #ifdef _WIN32
-        WSACleanup();
+        LOGE("Failed to bind WebSocket server to port 3131 (WSAError: %d)", WSAGetLastError());
+#else
+        LOGE("Failed to bind WebSocket server to port 3131 (errno: %d)", errno);
 #endif
+        closesocket(wsServerSocket);
+        wsServerSocket = INVALID_SOCKET;
         return;
     }
 
     if (listen(wsServerSocket, 5) == SOCKET_ERROR) {
-        LOGE("Failed to listen on WebSocket server socket (errno: %d)", errno);
-        closesocket(wsServerSocket);
 #ifdef _WIN32
-        WSACleanup();
+        LOGE("Failed to listen on WebSocket server socket (WSAError: %d)", WSAGetLastError());
+#else
+        LOGE("Failed to listen on WebSocket server socket (errno: %d)", errno);
 #endif
+        closesocket(wsServerSocket);
+        wsServerSocket = INVALID_SOCKET;
         return;
     }
 
@@ -908,8 +909,10 @@ void webSocketServerThread() {
         timeout.tv_usec = 100000;  // 100ms - responsive to new connections
 
         int activity = select(wsServerSocket + 1, &readfds, nullptr, nullptr, &timeout);
-        if (activity < 0) break;
+        if (activity < 0 || !wsServerRunning) break;
         if (activity == 0) continue;
+
+        if (!wsServerRunning) break;  // Check before accept() to avoid operating on closed socket
 
         if (FD_ISSET(wsServerSocket, &readfds)) {
             sockaddr_in clientAddr{};
@@ -1010,6 +1013,28 @@ void webSocketServerThread() {
 
                             LOGI("WebSocket handshake completed, %zu clients connected", clientCount);
 
+                            // Send connection status message so client knows the link is alive
+                            {
+                                bool gameActive = !currentRomName.empty();
+                                int bcastMode = broadcastModeProp_Val;
+                                const char* bcastName = (bcastMode == 1) ? "WebSocket" : (bcastMode == 2) ? "UDP" : (bcastMode == 3) ? "Both" : "Unknown";
+
+                                std::stringstream statusMsg;
+                                statusMsg << "{\"type\":\"connected\","
+                                          << "\"timestamp\":\"" << getTimestamp() << "\","
+                                          << "\"server\":\"score-server\","
+                                          << "\"version\":\"1.0\","
+                                          << "\"broadcastMode\":\"" << bcastName << "\","
+                                          << "\"gameActive\":" << (gameActive ? "true" : "false");
+                                if (gameActive) {
+                                    statusMsg << ",\"rom\":\"" << currentRomName << "\"";
+                                }
+                                statusMsg << addMachineIdField();
+                                statusMsg << "}";
+
+                                sendWebSocketFrame(clientSocket, statusMsg.str());
+                            }
+
                             // Send any queued messages to the new client
                             {
                                 std::lock_guard<std::mutex> queueLock(messageQueueMutex);
@@ -1056,21 +1081,8 @@ void webSocketServerThread() {
         }
     }
 
-    // Cleanup
-    {
-        std::lock_guard<std::mutex> lock(wsClientsMutex);
-        for (SOCKET client : wsClients) {
-            closesocket(client);
-        }
-        wsClients.clear();
-    }
-
-    closesocket(wsServerSocket);
-#ifdef _WIN32
-    WSACleanup();
-#endif
-
-    LOGI("WebSocket server thread stopped");
+    // Socket cleanup is handled by ScoreServerPluginUnload()
+    LOGI("WebSocket server thread exiting");
 }
 
 // Forward declaration
@@ -1601,7 +1613,8 @@ void extractAndLogCurrentScores() {
         }
     }
 
-    LOGI("Current Scores:\n%s", output.str().c_str());
+    // Just to have the log in the same format as high score logs for easier comparison
+    LOGI("Current Scores - %s", output.str().c_str());
 
     // Broadcast via WebSocket as JSON
     std::stringstream jsonOutput;
@@ -2217,25 +2230,31 @@ void checkAndBroadcastCurrentScores() {
         currentScores.push_back(score);
     }
 
-   // Check for game over condition
+   // Check for game over condition via NVRAM flag (primary method)
    bool currentGameOver = false;
    const JsonValue* gameOverObj = gameState->get("game_over");
-   if (gameOverObj)
+   bool hasNvramGameOverFlag = (gameOverObj != nullptr);
+   if (hasNvramGameOverFlag)
    {
       currentGameOver = (decodeValue(liveNvram, gameOverObj) != 0);
    }
 
-   // Skip detection on first check to establish baseline
-   if (firstStateCheck)
-   {
-      previousGameOver = currentGameOver;
-      firstStateCheck = false;
-   }
-   // Detect game over transition (false -> true)
-   else if (currentGameOver && !previousGameOver && !gameEndSent)
-   {
+   // Helper: check if any score in the list is non-zero
+   auto hasNonZeroScore = [](const std::vector<std::string>& scores) -> bool {
+      for (const auto& s : scores) {
+         if (s.empty() || s == "ERROR" || s == "???") continue;
+         for (char c : s) {
+            if (c != '0') return true;
+         }
+      }
+      return false;
+   };
+
+   // Helper: send game_end event and update state
+   auto sendGameEnd = [&](const char* detectionMethod) {
+      auto gameDuration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - gameStartTime);
       std::stringstream scoreLog;
-      scoreLog << "Game over detected via NVRAM. Final Scores: | ";
+      scoreLog << "Game over detected via " << detectionMethod << ". Final Scores: | ";
       for (size_t i = 0; i < currentScores.size(); ++i)
       {
          scoreLog << "P" << (i + 1) << ": " << currentScores[i] << " | ";
@@ -2243,20 +2262,80 @@ void checkAndBroadcastCurrentScores() {
       LOGI("%s", scoreLog.str().c_str());
 
       gameEndSent = true;
+      lastGameEndScores = currentScores;
 
-      // Broadcast game end message via WebSocket
+      // Build scores JSON array from current game scores
+      std::stringstream scoresJson;
+      scoresJson << "[";
+      for (size_t i = 0; i < currentScores.size(); ++i) {
+         if (i > 0) scoresJson << ",";
+         scoresJson << "{\"player\":\"Player " << (i + 1) << "\",\"score\":\"" << currentScores[i] << "\"}";
+      }
+      scoresJson << "]";
+
+      // Broadcast game end message via WebSocket (with scores and reason)
       std::stringstream gameEndMsg;
       gameEndMsg << "{\"type\":\"game_end\","
                  << "\"timestamp\":\"" << getTimestamp() << "\","
                  << "\"rom\":\"" << currentRomName << "\""
-                 << addMachineIdField() << "}";
+                 << addMachineIdField() << ","
+                 << "\"reason\":\"game_over\","
+                 << "\"game_duration\":" << gameDuration.count() << ","
+                 << "\"scores\":" << scoresJson.str() << "}";
       broadcastWebSocket(gameEndMsg.str());
 
       // Extract final high scores
-      extractAndSaveHighScores("Game end (NVRAM detected)");
+      std::string context = std::string("Game end (") + detectionMethod + ")";
+      extractAndSaveHighScores(context.c_str());
+   };
+
+   // Skip detection on first check to establish baseline (VPX startup / attract mode)
+   if (firstStateCheck)
+   {
+      previousGameOver = currentGameOver;
+      // On startup, if ball is already 0 with leftover scores, this is attract mode.
+      // Record current scores as lastGameEndScores so we don't falsely trigger game_end
+      // if the state doesn't change.
+      if (currentBall == 0 && hasNonZeroScore(currentScores))
+      {
+         lastGameEndScores = currentScores;
+         LOGI("Initial state: Ball=0 with existing scores (Attract Mode) - Recording baseline");
+      }
+      firstStateCheck = false;
    }
-   // Detect new game started via flag reset (true -> false)
-   else if (!currentGameOver && previousGameOver)
+   else if (!gameEndSent)
+   {
+      // === PRIMARY: NVRAM game_over flag detection (false -> true) ===
+      if (hasNvramGameOverFlag && currentGameOver && !previousGameOver)
+      {
+         sendGameEnd("NVRAM flag");
+      }
+      // === FALLBACK: Ball-drop detection (ball N>0 -> 0) ===
+      // Only fires if the NVRAM flag didn't already trigger game_end above.
+      // Detects game over when ball drops to 0, scores are non-zero,
+      // and these aren't the same scores from a previous game_end (attract mode).
+      else if (currentBall == 0 && previousCurrentBall > 0 && !gameEndSent)
+      {
+         if (hasNonZeroScore(currentScores) && currentScores != lastGameEndScores)
+         {
+            sendGameEnd("ball-drop fallback");
+         }
+         else
+         {
+            LOGI("Ball dropped to 0 but scores match last game end or are zero (Attract Mode) - Ignoring");
+         }
+      }
+   }
+
+   // === NEW GAME DETECTION: re-arm the game_end trigger ===
+   // Detect new game started when ball transitions from 0 to > 0
+   if (gameEndSent && currentBall > 0 && previousCurrentBall == 0)
+   {
+      LOGI("Ball changed from 0 to %d (New Game detected) - Re-arming game end trigger", currentBall);
+      gameEndSent = false;
+   }
+   // Also re-arm via NVRAM flag reset (true -> false) with ball > 0
+   else if (gameEndSent && hasNvramGameOverFlag && !currentGameOver && previousGameOver)
    {
       if (currentBall > 0)
       {
@@ -2281,7 +2360,7 @@ void checkAndBroadcastCurrentScores() {
         previousCurrentPlayer = currentPlayer;
         previousCurrentBall = currentBall;
         previousScores = currentScores;
-      previousGameOver = currentGameOver;
+        previousGameOver = currentGameOver;
 
         // Log and broadcast the change
         extractAndLogCurrentScores();
@@ -2295,6 +2374,7 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
     CtlOnGameStartMsg* msg = static_cast<CtlOnGameStartMsg*>(eventData);
     if (msg && msg->gameId) {
         currentRomName = msg->gameId;
+        gameStartTime = std::chrono::steady_clock::now();
         LOGI("Game started: %s", currentRomName.c_str());
 
         // Broadcast game start message via WebSocket
@@ -2322,9 +2402,10 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
         previousPlayerCount = 0;
         previousCurrentPlayer = 0;
         previousCurrentBall = 0;
-      previousGameOver = false;
-      gameEndSent = false;
-      firstStateCheck = true;
+        previousGameOver = false;
+        gameEndSent = false;
+        firstStateCheck = true;
+        lastGameEndScores.clear();
 
         // Extract high scores immediately on game start
         extractAndSaveHighScores("Game start");
@@ -2332,15 +2413,44 @@ void onGameStart(const unsigned int eventId, void* userData, void* eventData) {
 }
 
 void onGameEnd(const unsigned int eventId, void* userData, void* eventData) {
-    LOGI("Game ended: %s", currentRomName.c_str());
+    auto gameDuration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - gameStartTime);
+    LOGI("Game ended: %s (duration: %llds)", currentRomName.c_str(), (long long)gameDuration.count());
 
-    // Broadcast game end message via WebSocket
+    // Skip if game lasted less than minimum duration (spurious event on some platforms)
+    if (gameDuration < MIN_GAME_DURATION) {
+        LOGI("Game duration too short (%llds < %llds), ignoring spurious game_end event",
+             (long long)gameDuration.count(), (long long)MIN_GAME_DURATION.count());
+        return;
+    }
+
+    // Skip if game_end was already sent by NVRAM/ball-drop detection
+    if (gameEndSent) {
+        LOGI("game_end already sent by NVRAM detection, skipping duplicate broadcast");
+        extractAndSaveHighScores("Game end");
+        currentMapPath.clear();
+        return;
+    }
+
+    // Build scores JSON from lastGameEndScores (set by NVRAM/ball-drop detection if it fired first)
+    std::stringstream scoresJson;
+    scoresJson << "[";
+    for (size_t i = 0; i < lastGameEndScores.size(); ++i) {
+        if (i > 0) scoresJson << ",";
+        scoresJson << "{\"player\":\"Player " << (i + 1) << "\",\"score\":\"" << lastGameEndScores[i] << "\"}";
+    }
+    scoresJson << "]";
+
+    // Broadcast game end message via WebSocket (with scores and reason)
     std::stringstream gameEndMsg;
     gameEndMsg << "{\"type\":\"game_end\","
                << "\"timestamp\":\"" << getTimestamp() << "\","
                << "\"rom\":\"" << currentRomName << "\""
-               << addMachineIdField() << "}";
+               << addMachineIdField() << ","
+               << "\"reason\":\"game_over\","
+               << "\"game_duration\":" << gameDuration.count() << ","
+               << "\"scores\":" << scoresJson.str() << "}";
     broadcastWebSocket(gameEndMsg.str());
+    gameEndSent = true;
 
     extractAndSaveHighScores("Game end");
 
@@ -2391,6 +2501,7 @@ public:
         // Handle game state changes - send lifecycle events separately
         if (gameState == 1) {
             // Game Start - send dedicated game_start event
+            gameStartTime = std::chrono::steady_clock::now();
             std::stringstream gameStartMsg;
             gameStartMsg << "{\"type\":\"game_start\","
                          << "\"timestamp\":\"" << getTimestamp() << "\","
@@ -2402,14 +2513,26 @@ public:
             // Also broadcast current scores after game start
             broadcastTableScores();
         } else if (gameState == 3) {
-            // Game End - send dedicated game_end event
-            std::stringstream gameEndMsg;
-            gameEndMsg << "{\"type\":\"game_end\","
-                       << "\"timestamp\":\"" << getTimestamp() << "\","
-                       << "\"rom\":\"" << tableGameName << "\""
-                       << addMachineIdField() << "}";
-            broadcastWebSocket(gameEndMsg.str());
-            LOGI("Game end event sent for: %s", tableGameName.c_str());
+            // Game End - send dedicated game_end event (only if not already sent)
+            auto gameDuration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - gameStartTime);
+            if (gameDuration < MIN_GAME_DURATION) {
+                LOGI("Game duration too short (%llds < %llds), ignoring spurious game_end from SetGameState",
+                     (long long)gameDuration.count(), (long long)MIN_GAME_DURATION.count());
+            } else if (!gameEndSent) {
+                std::stringstream gameEndMsg;
+                gameEndMsg << "{\"type\":\"game_end\","
+                           << "\"timestamp\":\"" << getTimestamp() << "\","
+                           << "\"rom\":\"" << tableGameName << "\""
+                           << addMachineIdField() << ","
+                           << "\"reason\":\"game_over\","
+                           << "\"game_duration\":" << gameDuration.count()
+                           << "}";
+                broadcastWebSocket(gameEndMsg.str());
+                gameEndSent = true;
+                LOGI("Game end event sent for: %s", tableGameName.c_str());
+            } else {
+                LOGI("Game end event already sent for: %s, skipping SetGameState broadcast", tableGameName.c_str());
+            }
 
             // Also broadcast final scores after game end
             broadcastTableScores();
@@ -2571,6 +2694,15 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
     msgApi->RegisterSetting(endpointId, &udpHostProp);
     msgApi->RegisterSetting(endpointId, &udpPortProp);
 
+#ifdef _WIN32
+    // Initialize Winsock on Windows (must be done before any socket operations)
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        LOGE("WSAStartup failed");
+        return;
+    }
+#endif
+
     // Initialize UDP client if UDP mode is enabled
     int broadcastMode = broadcastModeProp_Val;  // 1=WebSocket, 2=UDP, 3=Both
     const char* modeName = (broadcastMode == 1) ? "WebSocket" : (broadcastMode == 2) ? "UDP" : (broadcastMode == 3) ? "Both" : "Unknown";
@@ -2632,15 +2764,6 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginLoad(const uint32_t sessionId, const
     // Subscribe to frame prepare event for periodic current score logging
     msgApi->SubscribeMsg(endpointId, onPrepareFrameId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_EVT_ON_PREPARE_FRAME), onPrepareFrame, nullptr);
 
-#ifdef _WIN32
-    // Initialize Winsock on Windows
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        LOGE("WSAStartup failed");
-        return;
-    }
-#endif
-
     // Start WebSocket server (unless in UDP-only mode)
     if (broadcastMode != 2) {  // Skip WebSocket server in UDP-only mode
         serverStartTime = std::chrono::steady_clock::now();  // Mark server start time for message queue window
@@ -2656,13 +2779,26 @@ MSGPI_EXPORT void MSGPIAPI ScoreServerPluginUnload()
 {
     LOGI("Score Server Plugin unloading");
 
-    // Send game_end message if a game was active
+    // Send game_end message if a game was active (with plugin_unload reason)
     if (!currentRomName.empty()) {
+        // Build scores JSON from lastGameEndScores (scores from the last finished game, if any)
+        std::stringstream scoresJson;
+        scoresJson << "[";
+        for (size_t i = 0; i < lastGameEndScores.size(); ++i) {
+            if (i > 0) scoresJson << ",";
+            scoresJson << "{\"player\":\"Player " << (i + 1) << "\",\"score\":\"" << lastGameEndScores[i] << "\"}";
+        }
+        scoresJson << "]";
+
+        auto gameDuration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - gameStartTime);
         std::stringstream gameEndMsg;
         gameEndMsg << "{\"type\":\"game_end\","
                    << "\"timestamp\":\"" << getTimestamp() << "\","
                    << "\"rom\":\"" << currentRomName << "\""
-                   << addMachineIdField() << "}";
+                   << addMachineIdField() << ","
+                   << "\"reason\":\"plugin_unload\","
+                   << "\"game_duration\":" << gameDuration.count() << ","
+                   << "\"scores\":" << scoresJson.str() << "}";
         broadcastWebSocket(gameEndMsg.str());
 
         // Give a brief moment for the message to be sent
